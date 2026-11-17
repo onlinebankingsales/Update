@@ -45,6 +45,7 @@ class EmployeeWorkflowTests(unittest.TestCase):
             "Regional Manager",
             "safe-password-2",
             phone_number="+919000000001",
+            employee_tag="RM",
         )
         self.second_rm_id = data_store.create_account(
             self.admin_id,
@@ -52,6 +53,7 @@ class EmployeeWorkflowTests(unittest.TestCase):
             "Second Manager",
             "safe-password-3",
             phone_number="+919000000002",
+            employee_tag="RM",
         )
         self.so_id = data_store.create_account(
             self.admin_id,
@@ -59,6 +61,7 @@ class EmployeeWorkflowTests(unittest.TestCase):
             "Sales Officer",
             "safe-password-4",
             phone_number="+919000000003",
+            employee_tag="SO",
         )
 
     def tearDown(self):
@@ -115,6 +118,36 @@ class EmployeeWorkflowTests(unittest.TestCase):
         self.assertEqual(rm_owned_record["Stage"], "Login")
         with self.assertRaisesRegex(ValueError, "only update your own"):
             data_store.update_proposal(self.second_rm_id, proposal_id, stage="Login")
+
+    def test_employee_role_is_explicit_and_admin_has_no_employee_role(self):
+        admin = next(
+            user for user in data_store.list_users(self.super_admin_id)
+            if user["id"] == self.admin_id
+        )
+        self.assertIsNone(admin["employee_tag"])
+
+        with self.assertRaisesRegex(ValueError, "Choose RM or SO"):
+            data_store.create_account(
+                self.admin_id,
+                "600777",
+                "Unclassified employee",
+                "safe-password-5",
+                phone_number="+919000000005",
+            )
+
+        employee_id = data_store.create_account(
+            self.admin_id,
+            "600777",
+            "Explicit RM",
+            "safe-password-5",
+            phone_number="+919000000005",
+            employee_tag="RM",
+        )
+        employee = next(
+            user for user in data_store.list_users(self.admin_id)
+            if user["id"] == employee_id
+        )
+        self.assertEqual(employee["employee_tag"], "RM")
 
     def test_proposal_stage_advances_one_step_and_commitment_is_saved(self):
         proposal_id = self._add_record(self.so_id, "Commitment customer")

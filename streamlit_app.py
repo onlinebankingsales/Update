@@ -502,6 +502,12 @@ if is_admin:
                 else:
                     st.text_input("Account type", value="Employee", disabled=True)
                     account_role = "user"
+                new_employee_tag = None
+                if account_role == "user":
+                    new_employee_tag = st.selectbox(
+                        "Employee role",
+                        options=EMPLOYEE_TAGS,
+                    )
                 new_phone_number = st.text_input(
                     (
                         "Employee WhatsApp number (international format)"
@@ -524,6 +530,7 @@ if is_admin:
                         new_password,
                         account_role,
                         new_phone_number,
+                        new_employee_tag,
                     )
                 except ValueError as error:
                     st.error(str(error))
@@ -557,7 +564,7 @@ if is_admin:
                         "created_by_username": "Created by",
                         "created_at": "Created at",
                         "role": "Access level",
-                        "employee_tag": "Employee tag",
+                        "employee_tag": "Employee role",
                         "assigned_rm_name": "Assigned RM",
                         "phone_number": "WhatsApp number",
                     }
@@ -675,7 +682,7 @@ if is_admin:
                 )
                 selected_employee = employees_by_id[selected_employee_id]
                 selected_tag = st.selectbox(
-                    "Employee tag",
+                    "Employee role",
                     options=EMPLOYEE_TAGS,
                     index=EMPLOYEE_TAGS.index(
                         selected_employee.get("employee_tag") or "SO"
@@ -825,7 +832,7 @@ else:
     )
 
     role_tag = current_user.get("employee_tag") or "SO"
-    st.caption(f"Employee tag: {role_tag}")
+    st.caption(f"Employee role: {role_tag}")
     entry_tab, records_tab, commitment_tab = st.tabs(
         ["New entry", "My records", "Commitments for the day"]
     )

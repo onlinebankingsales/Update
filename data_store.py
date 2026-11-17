@@ -676,6 +676,7 @@ def create_account(
     password,
     role="user",
     phone_number="",
+    employee_tag=None,
 ):
     username = username.strip()
     employee_name = employee_name.strip()
@@ -689,10 +690,12 @@ def create_account(
         raise ValueError("Password must be at least 8 characters.")
     if role not in ("admin", "user"):
         raise ValueError("Choose a valid account role.")
+    if role == "user":
+        if employee_tag not in EMPLOYEE_TAGS:
+            raise ValueError("Choose RM or SO as the employee role.")
+    else:
+        employee_tag = None
     normalized_phone = _normalize_phone(phone_number, required=(role == "user"))
-    employee_tag = (
-        ("SO" if username.startswith("6") else "RM") if role == "user" else None
-    )
 
     with _connection(write=True) as connection:
         requester = connection.execute(

@@ -40,9 +40,10 @@ such as a persistent volume when deploying.
 - Administrators can create and delete only the employees they created, and can
    view or download only those employees' records. They can also reset the
    passwords of those employees.
-- Employees are tagged SO when their username/employee ID starts with `6`;
-  other employee IDs default to RM. Administrators can change the tag and
-  assign SO employees to an RM.
+- At employee onboarding, select RM or SO as the employee role; the role is
+  not inferred from the username or employee ID. Admin accounts do not require
+  an employee role. Administrators can change employee roles and assign SO
+  employees to an RM.
 - Employees can view and download their own proposals. RMs can also view,
   download proposals belonging to SO employees assigned to them, but can update
   only their own proposals. SO employees can update only their own proposals.

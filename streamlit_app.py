@@ -21,19 +21,29 @@ except StreamlitSecretNotFoundError:
 
 from data_store import (
     DATABASE_URL,
+    EMPLOYEE_TAGS,
+    PROPOSAL_STAGES,
     REMARK_OPTIONS,
     SUPER_ADMIN_USERNAME,
+    assign_so_to_rm,
     add_record,
     authenticate,
     change_own_password,
     create_account,
     delete_user,
+    get_available_records,
     get_admin_records,
+    get_daily_commitments,
+    get_owned_records,
     get_user,
     get_user_records,
     initialize_database,
     list_users,
+    update_admin_phone,
     reset_user_password,
+    save_commitment_response,
+    update_employee_profile,
+    update_proposal,
 )
 
 APP_TIMEZONE = timezone(timedelta(hours=5, minutes=30), name="UTC+05:30")
@@ -348,6 +358,8 @@ if current_user is None:
 is_super_admin = current_user["role"] == "super_admin"
 is_admin = current_user["role"] in ("admin", "super_admin")
 role_label = "Super administrator" if is_super_admin else "Administrator" if is_admin else "Employee"
+if not is_admin:
+    role_label = f"Employee · {current_user.get('employee_tag') or 'SO'}"
 
 with st.container(border=True):
     account_identity, account_actions = st.columns([3, 2])
@@ -414,8 +426,8 @@ if is_admin:
     if notice := st.session_state.pop("admin_notice", None):
         st.success(notice)
 
-    overview_tab, accounts_tab, records_tab = st.tabs(
-        ["Overview", "Accounts", "Records"]
+    overview_tab, accounts_tab, records_tab, commitments_tab = st.tabs(
+        ["Overview", "Accounts", "Records", "Commitments"]
     )
     with overview_tab:
         metric_columns = st.columns(3 if is_super_admin else 2)
@@ -490,6 +502,14 @@ if is_admin:
                 else:
                     st.text_input("Account type", value="Employee", disabled=True)
                     account_role = "user"
+                new_phone_number = st.text_input(
+                    (
+                        "Employee WhatsApp number (international format)"
+                        if account_role == "user"
+                        else "Administrator WhatsApp number for reports (optional)"
+                    ),
+                    placeholder="+919876543210",
+                )
                 new_password = st.text_input("Initial password", type="password")
                 add_submitted = st.form_submit_button(
                     "Create account", width="stretch"
@@ -503,6 +523,7 @@ if is_admin:
                         new_employee_name,
                         new_password,
                         account_role,
+                        new_phone_number,
                     )
                 except ValueError as error:
                     st.error(str(error))
@@ -518,7 +539,15 @@ if is_admin:
             st.subheader("Managed accounts")
             if managed_users:
                 users_df = pd.DataFrame(managed_users)
-                display_columns = ["username", "employee_name", "role", "created_at"]
+                display_columns = [
+                    "username",
+                    "employee_name",
+                    "employee_tag",
+                    "assigned_rm_name",
+                    "phone_number",
+                    "role",
+                    "created_at",
+                ]
                 if is_super_admin:
                     display_columns.insert(3, "created_by_username")
                 users_df = users_df[display_columns].rename(
@@ -528,6 +557,9 @@ if is_admin:
                         "created_by_username": "Created by",
                         "created_at": "Created at",
                         "role": "Access level",
+                        "employee_tag": "Employee tag",
+                        "assigned_rm_name": "Assigned RM",
+                        "phone_number": "WhatsApp number",
                     }
                 )
                 users_df["Access level"] = users_df["Access level"].map(
@@ -589,6 +621,136 @@ if is_admin:
         else:
             st.info("There are no other accounts in your scope.")
 
+        employee_users = [user for user in managed_users if user["role"] == "user"]
+        if is_super_admin:
+            admin_users = [
+                user
+                for user in managed_users
+                if user["role"] == "admin"
+            ]
+            if admin_users:
+                st.divider()
+                st.subheader("Update administrator report number")
+                admins_by_id = {user["id"]: user for user in admin_users}
+                with st.form("admin_phone_form"):
+                    selected_admin_id = st.selectbox(
+                        "Administrator",
+                        options=list(admins_by_id),
+                        format_func=lambda user_id: (
+                            f"{admins_by_id[user_id]['employee_name']} · "
+                            f"{admins_by_id[user_id]['username']}"
+                        ),
+                    )
+                    admin_phone = st.text_input(
+                        "WhatsApp number",
+                        value=admins_by_id[selected_admin_id].get("phone_number") or "",
+                        placeholder="+919876543210",
+                    )
+                    admin_phone_submitted = st.form_submit_button(
+                        "Save administrator number", width="stretch"
+                    )
+                if admin_phone_submitted:
+                    try:
+                        update_admin_phone(
+                            current_user["id"], selected_admin_id, admin_phone
+                        )
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.success("Administrator report number updated.")
+                        st.rerun()
+
+        if employee_users:
+            st.divider()
+            st.subheader("Update employee role and assignment")
+            employees_by_id = {user["id"]: user for user in employee_users}
+            with st.form("employee_profile_form"):
+                selected_employee_id = st.selectbox(
+                    "Employee",
+                    options=list(employees_by_id),
+                    format_func=lambda user_id: (
+                        f"{employees_by_id[user_id]['employee_name']} · "
+                        f"{employees_by_id[user_id]['username']}"
+                    ),
+                )
+                selected_employee = employees_by_id[selected_employee_id]
+                selected_tag = st.selectbox(
+                    "Employee tag",
+                    options=EMPLOYEE_TAGS,
+                    index=EMPLOYEE_TAGS.index(
+                        selected_employee.get("employee_tag") or "SO"
+                    ),
+                )
+                updated_phone_number = None
+                if is_super_admin:
+                    updated_phone_number = st.text_input(
+                        "WhatsApp number",
+                        value=selected_employee.get("phone_number") or "",
+                        placeholder="+919876543210",
+                    )
+                update_employee_submitted = st.form_submit_button(
+                    "Save employee details", width="stretch"
+                )
+            if update_employee_submitted:
+                try:
+                    update_employee_profile(
+                        current_user["id"],
+                        selected_employee_id,
+                        employee_tag=selected_tag,
+                        phone_number=updated_phone_number,
+                    )
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    st.success("Employee details updated.")
+                    st.rerun()
+
+            so_users = [
+                user for user in employee_users if user.get("employee_tag") == "SO"
+            ]
+            rm_users = [
+                user for user in employee_users if user.get("employee_tag") == "RM"
+            ]
+            if so_users and rm_users:
+                st.subheader("Assign SO employees to an RM")
+                so_by_id = {user["id"]: user for user in so_users}
+                rm_by_id = {user["id"]: user for user in rm_users}
+                with st.form("assign_so_to_rm_form"):
+                    selected_so_id = st.selectbox(
+                        "SO employee",
+                        options=list(so_by_id),
+                        format_func=lambda user_id: (
+                            f"{so_by_id[user_id]['employee_name']} · "
+                            f"{so_by_id[user_id]['username']}"
+                        ),
+                    )
+                    current_rm = so_by_id[selected_so_id].get("assigned_rm_id")
+                    rm_options = list(rm_by_id)
+                    selected_rm_id = st.selectbox(
+                        "Assign to RM",
+                        options=rm_options,
+                        index=rm_options.index(current_rm)
+                        if current_rm in rm_options
+                        else 0,
+                        format_func=lambda user_id: (
+                            f"{rm_by_id[user_id]['employee_name']} · "
+                            f"{rm_by_id[user_id]['username']}"
+                        ),
+                    )
+                    assignment_submitted = st.form_submit_button(
+                        "Save assignment", width="stretch"
+                    )
+                if assignment_submitted:
+                    try:
+                        assign_so_to_rm(
+                            current_user["id"], selected_so_id, selected_rm_id
+                        )
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.success("SO assignment updated.")
+                        st.rerun()
+
         deletable_users = [
             user for user in managed_users if user["id"] != current_user["id"]
         ]
@@ -645,6 +807,15 @@ if is_admin:
             st.dataframe(records_df, width="stretch", hide_index=True)
         else:
             st.info("No records are available in this scope.")
+    with commitments_tab:
+        st.subheader("Employee commitments")
+        commitment_rows = get_daily_commitments(current_user["id"])
+        if commitment_rows:
+            st.dataframe(
+                pd.DataFrame(commitment_rows), width="stretch", hide_index=True
+            )
+        else:
+            st.info("No commitments have been submitted today.")
 else:
     st.markdown('<p class="eyebrow">EMPLOYEE WORKSPACE</p>', unsafe_allow_html=True)
     st.title(f"Welcome, {current_user['employee_name']}")
@@ -653,7 +824,11 @@ else:
         unsafe_allow_html=True,
     )
 
-    entry_tab, records_tab = st.tabs(["New entry", "My records"])
+    role_tag = current_user.get("employee_tag") or "SO"
+    st.caption(f"Employee tag: {role_tag}")
+    entry_tab, records_tab, commitment_tab = st.tabs(
+        ["New entry", "My records", "Commitments for the day"]
+    )
     with entry_tab:
         st.subheader("Capture a customer entry")
         st.caption("Fields marked with * are required.")
@@ -672,7 +847,7 @@ else:
                     disabled=True,
                 )
 
-            customer_column, contact_column, acres_column = st.columns(3)
+            customer_column, contact_column, acres_column, loan_column = st.columns(4)
             with customer_column:
                 customer_name = st.text_input("Customer name *")
             with contact_column:
@@ -683,6 +858,14 @@ else:
                     min_value=0.0,
                     value=None,
                     step=0.01,
+                    format="%.2f",
+                )
+            with loan_column:
+                loan_amount = st.number_input(
+                    "Loan amount",
+                    min_value=0.0,
+                    value=0.0,
+                    step=10000.0,
                     format="%.2f",
                 )
 
@@ -728,6 +911,7 @@ else:
                         mandal.strip(),
                         district.strip(),
                         remarks,
+                        loan_amount,
                     )
                 except ValueError as error:
                     st.error(str(error))
@@ -737,10 +921,193 @@ else:
     with records_tab:
         own_records = get_user_records(current_user["id"])
         if own_records:
-            st.dataframe(
-                pd.DataFrame(own_records), width="stretch", hide_index=True
+            if role_tag == "RM":
+                st.caption(
+                    "This view includes your proposals and assigned SO proposals. "
+                    "Only your own proposals can be updated."
+                )
+            records_df = pd.DataFrame(own_records)
+            download_buffer = BytesIO()
+            with pd.ExcelWriter(download_buffer, engine="openpyxl") as writer:
+                records_df.to_excel(writer, sheet_name="My Proposals", index=False)
+            st.download_button(
+                "Download my proposals",
+                data=download_buffer.getvalue(),
+                file_name=(
+                    f"my_proposals_{datetime.now(APP_TIMEZONE).date().isoformat()}.xlsx"
+                ),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+            st.dataframe(
+                records_df, width="stretch", hide_index=True
+            )
+            record_by_id = {
+                int(record["Proposal ID"]): record
+                for record in get_owned_records(current_user["id"])
+            }
+            if record_by_id:
+                st.subheader("Update your own proposal stage or loan amount")
+                with st.form("update_proposal_form"):
+                    selected_record_id = st.selectbox(
+                        "Proposal",
+                        options=list(record_by_id),
+                        format_func=lambda record_id: (
+                            f"#{record_id} · {record_by_id[record_id]['Customer Name']} · "
+                            f"{record_by_id[record_id]['Stage']}"
+                        ),
+                    )
+                    selected_record = record_by_id[selected_record_id]
+                    stage_index = PROPOSAL_STAGES.index(selected_record["Stage"])
+                    allowed_stages = PROPOSAL_STAGES[stage_index : stage_index + 2]
+                    proposed_stage = st.selectbox(
+                        "Stage",
+                        options=allowed_stages,
+                        index=0,
+                    )
+                    proposed_loan_amount = st.number_input(
+                        "Loan amount",
+                        min_value=0.0,
+                        value=float(selected_record["Loan Amount"] or 0),
+                        step=10000.0,
+                        format="%.2f",
+                    )
+                    update_proposal_submitted = st.form_submit_button(
+                        "Update proposal", width="stretch"
+                    )
+                if update_proposal_submitted:
+                    try:
+                        update_proposal(
+                            current_user["id"],
+                            selected_record_id,
+                            stage=proposed_stage,
+                            loan_amount=proposed_loan_amount,
+                        )
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.success("Proposal updated.")
+                        st.rerun()
+            else:
+                st.info("You do not have any proposals of your own to update.")
         else:
             st.info("Your saved entries will appear here.")
+
+    with commitment_tab:
+        st.caption(
+            "Choose whether you are committing to log a proposal and/or disburse "
+            "a proposal today. Login commitments move the selected proposal to Login."
+        )
+        available_login = get_owned_records(
+            current_user["id"], stages=("Yet to login",)
+        )
+        available_disbursement = get_available_records(
+            current_user["id"], stages=("SUD",)
+        )
+        login_by_id = {
+            int(record["Proposal ID"]): record for record in available_login
+        }
+        disbursement_by_id = {
+            int(record["Proposal ID"]): record for record in available_disbursement
+        }
+
+        st.subheader("Login commitment")
+        with st.form("login_commitment_form"):
+            login_answer = st.radio(
+                "Will you log a proposal today?",
+                options=("Yes", "No"),
+                horizontal=True,
+                key="login_commitment_answer",
+            )
+            login_record_id = None
+            login_amount = None
+            if login_answer == "Yes":
+                if login_by_id:
+                    login_record_id = st.selectbox(
+                        "Proposal to log",
+                        options=list(login_by_id),
+                        format_func=lambda record_id: (
+                            f"#{record_id} · "
+                            f"{login_by_id[record_id]['Customer Name']} · "
+                            f"{login_by_id[record_id]['Employee Name']}"
+                        ),
+                        key="login_commitment_record",
+                    )
+                    login_amount = st.number_input(
+                        "Updated loan amount",
+                        min_value=0.0,
+                        value=float(login_by_id[login_record_id]["Loan Amount"] or 0),
+                        step=10000.0,
+                        format="%.2f",
+                        key="login_commitment_amount",
+                    )
+                else:
+                    st.info("There are no Yet to login proposals available.")
+            login_commitment_submitted = st.form_submit_button(
+                "Save login commitment", width="stretch"
+            )
+        if login_commitment_submitted:
+            if login_answer == "Yes" and login_record_id is None:
+                st.error("There are no proposals available to commit.")
+            else:
+                try:
+                    save_commitment_response(
+                        current_user["id"],
+                        "Login",
+                        login_answer,
+                        [login_record_id] if login_record_id is not None else (),
+                    )
+                    if login_answer == "Yes":
+                        update_proposal(
+                            current_user["id"],
+                            login_record_id,
+                            stage="Login",
+                            loan_amount=login_amount,
+                        )
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    st.success("Login commitment saved.")
+
+        st.subheader("Disbursement commitment")
+        with st.form("disbursement_commitment_form"):
+            disbursement_answer = st.radio(
+                "Will you disburse proposals today?",
+                options=("Yes", "No"),
+                horizontal=True,
+                key="disbursement_commitment_answer",
+            )
+            selected_disbursement_ids = ()
+            if disbursement_answer == "Yes":
+                if disbursement_by_id:
+                    selected_disbursement_ids = st.multiselect(
+                        "SUD proposals to commit",
+                        options=list(disbursement_by_id),
+                        format_func=lambda record_id: (
+                            f"#{record_id} · "
+                            f"{disbursement_by_id[record_id]['Customer Name']} · "
+                            f"{disbursement_by_id[record_id]['Employee Name']}"
+                        ),
+                        key="disbursement_commitment_records",
+                    )
+                else:
+                    st.info("There are no SUD proposals available.")
+            disbursement_commitment_submitted = st.form_submit_button(
+                "Save disbursement commitment", width="stretch"
+            )
+        if disbursement_commitment_submitted:
+            if disbursement_answer == "Yes" and not selected_disbursement_ids:
+                st.error("Select at least one SUD proposal for a Yes commitment.")
+            else:
+                try:
+                    save_commitment_response(
+                        current_user["id"],
+                        "Disbursement",
+                        disbursement_answer,
+                        selected_disbursement_ids,
+                    )
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    st.success("Disbursement commitment saved.")
 
 render_copyright_footer()

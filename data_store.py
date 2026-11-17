@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import math
 import os
 import re
 import secrets
@@ -18,6 +19,15 @@ PASSWORD_ITERATIONS = 600_000
 USERNAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]{3,32}\Z")
 DUMMY_SALT = b"streamlit-field-app-login-salt"
 REMARK_OPTIONS = ("Interested", "Not interested")
+EMPLOYEE_TAGS = ("RM", "SO")
+PROPOSAL_STAGES = (
+    "Yet to login",
+    "Login",
+    "Pending for Sanction",
+    "SUD",
+    "Disbursement",
+)
+COMMITMENT_TYPES = ("Login", "Disbursement")
 APP_TIMEZONE = timezone(timedelta(hours=5, minutes=30), name="UTC+05:30")
 
 
@@ -180,6 +190,8 @@ def _insert_user(
     password,
     role,
     created_by_user_id=None,
+    phone_number=None,
+    employee_tag=None,
 ):
     salt = secrets.token_bytes(16)
     password_hash = _password_digest(password, salt)
@@ -187,8 +199,8 @@ def _insert_user(
         """
         INSERT INTO users
             (username, employee_name, password_salt, password_hash, role,
-             created_at, created_by_user_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+             created_at, created_by_user_id, phone_number, employee_tag)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         """,
         (
@@ -199,6 +211,8 @@ def _insert_user(
             role,
             datetime.now(APP_TIMEZONE).isoformat(timespec="seconds"),
             created_by_user_id,
+            phone_number,
+            employee_tag,
         ),
     )
     return cursor.fetchone()["id"]
@@ -216,7 +230,10 @@ def _initialize_sqlite_schema(connection):
             role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
             created_at TEXT NOT NULL,
             created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+            phone_number TEXT,
+            employee_tag TEXT CHECK (employee_tag IN ('RM', 'SO') OR employee_tag IS NULL),
+            assigned_rm_id INTEGER REFERENCES users(id) ON DELETE SET NULL
         );
         CREATE TABLE IF NOT EXISTS records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,7 +249,33 @@ def _initialize_sqlite_schema(connection):
             mandal TEXT NOT NULL,
             district TEXT NOT NULL,
             remarks TEXT NOT NULL DEFAULT 'Not interested'
-            CHECK (remarks IN ('Interested', 'Not interested'))
+            CHECK (remarks IN ('Interested', 'Not interested')),
+            stage TEXT NOT NULL DEFAULT 'Yet to login',
+            loan_amount REAL NOT NULL DEFAULT 0 CHECK (loan_amount >= 0),
+            stage_updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS commitments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+            commitment_type TEXT NOT NULL CHECK (commitment_type IN ('Login', 'Disbursement')),
+            commitment_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(employee_user_id, record_id, commitment_type, commitment_date)
+        );
+        CREATE TABLE IF NOT EXISTS commitment_responses (
+            employee_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            commitment_type TEXT NOT NULL CHECK (commitment_type IN ('Login', 'Disbursement')),
+            commitment_date TEXT NOT NULL,
+            answer TEXT NOT NULL CHECK (answer IN ('Yes', 'No')),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(employee_user_id, commitment_type, commitment_date)
+        );
+        CREATE TABLE IF NOT EXISTS whatsapp_sessions (
+            employee_user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            state TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS records_user_date_idx
             ON records(user_id, entry_date, id);
@@ -253,6 +296,18 @@ def _initialize_sqlite_schema(connection):
         connection.execute(
             "UPDATE users SET is_active = 1 WHERE is_active IS NULL"
         )
+    for column, definition in (
+        ("phone_number", "TEXT"),
+        ("employee_tag", "TEXT"),
+        ("assigned_rm_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL"),
+    ):
+        if column not in user_columns:
+            connection.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+    connection.execute(
+        """UPDATE users SET employee_tag =
+           CASE WHEN username LIKE '6%' THEN 'SO' ELSE 'RM' END
+           WHERE role = 'user' AND employee_tag IS NULL"""
+    )
 
     record_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(records)")
@@ -269,6 +324,25 @@ def _initialize_sqlite_schema(connection):
         connection.execute(
             "UPDATE records SET remarks = 'Not interested' WHERE remarks IS NULL"
         )
+    for column, definition in (
+        ("stage", "TEXT NOT NULL DEFAULT 'Yet to login'"),
+        ("loan_amount", "REAL NOT NULL DEFAULT 0"),
+        ("stage_updated_at", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if column not in record_columns:
+            connection.execute(f"ALTER TABLE records ADD COLUMN {column} {definition}")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS users_assigned_rm_idx ON users(assigned_rm_id)"
+    )
+    connection.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS users_active_phone_idx
+           ON users(phone_number)
+           WHERE phone_number IS NOT NULL AND is_active = 1"""
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS commitments_day_idx "
+        "ON commitments(employee_user_id, commitment_date, commitment_type)"
+    )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS users_creator_idx ON users(created_by_user_id)"
     )
@@ -290,7 +364,10 @@ def _initialize_postgres_schema(connection):
             role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
             created_at TEXT NOT NULL,
             created_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
-            is_active SMALLINT NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))
+            is_active SMALLINT NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+            phone_number TEXT,
+            employee_tag TEXT CHECK (employee_tag IN ('RM', 'SO') OR employee_tag IS NULL),
+            assigned_rm_id BIGINT REFERENCES users(id) ON DELETE SET NULL
         )
         """
     )
@@ -309,7 +386,10 @@ def _initialize_postgres_schema(connection):
             village TEXT NOT NULL,
             mandal TEXT NOT NULL,
             district TEXT NOT NULL,
-            remarks TEXT NOT NULL DEFAULT 'Not interested'
+            remarks TEXT NOT NULL DEFAULT 'Not interested',
+            stage TEXT NOT NULL DEFAULT 'Yet to login',
+            loan_amount DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (loan_amount >= 0),
+            stage_updated_at TEXT NOT NULL DEFAULT ''
         )
         """
     )
@@ -323,6 +403,20 @@ def _initialize_postgres_schema(connection):
     connection.execute(
         "UPDATE users SET is_active = 1 WHERE is_active IS NULL"
     )
+    connection.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number TEXT")
+    connection.execute(
+        """ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_tag TEXT
+           CHECK (employee_tag IN ('RM', 'SO') OR employee_tag IS NULL)"""
+    )
+    connection.execute(
+        """ALTER TABLE users ADD COLUMN IF NOT EXISTS assigned_rm_id BIGINT
+           REFERENCES users(id) ON DELETE SET NULL"""
+    )
+    connection.execute(
+        """UPDATE users SET employee_tag =
+           CASE WHEN username LIKE '6%' THEN 'SO' ELSE 'RM' END
+           WHERE role = 'user' AND employee_tag IS NULL"""
+    )
     connection.execute(
         """ALTER TABLE records ADD COLUMN IF NOT EXISTS admin_owner_id
            BIGINT REFERENCES users(id) ON DELETE SET NULL"""
@@ -334,11 +428,67 @@ def _initialize_postgres_schema(connection):
         "UPDATE records SET remarks = 'Not interested' WHERE remarks IS NULL"
     )
     connection.execute(
+        "ALTER TABLE records ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'Yet to login'"
+    )
+    connection.execute(
+        "ALTER TABLE records ADD COLUMN IF NOT EXISTS loan_amount DOUBLE PRECISION NOT NULL DEFAULT 0"
+    )
+    connection.execute(
+        "ALTER TABLE records ADD COLUMN IF NOT EXISTS stage_updated_at TEXT NOT NULL DEFAULT ''"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS commitments (
+            id BIGSERIAL PRIMARY KEY,
+            employee_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            record_id BIGINT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+            commitment_type TEXT NOT NULL CHECK (commitment_type IN ('Login', 'Disbursement')),
+            commitment_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(employee_user_id, record_id, commitment_type, commitment_date)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS commitment_responses (
+            employee_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            commitment_type TEXT NOT NULL CHECK (commitment_type IN ('Login', 'Disbursement')),
+            commitment_date TEXT NOT NULL,
+            answer TEXT NOT NULL CHECK (answer IN ('Yes', 'No')),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(employee_user_id, commitment_type, commitment_date)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS whatsapp_sessions (
+            employee_user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            state TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx "
         "ON users (LOWER(username))"
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS users_creator_idx ON users(created_by_user_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS users_assigned_rm_idx ON users(assigned_rm_id)"
+    )
+    connection.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS users_active_phone_idx
+           ON users(phone_number)
+           WHERE phone_number IS NOT NULL AND is_active = 1"""
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS commitments_day_idx "
+        "ON commitments(employee_user_id, commitment_date, commitment_type)"
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS records_user_date_idx "
@@ -488,7 +638,8 @@ def authenticate(username, password):
 def get_user(user_id):
     with _connection() as connection:
         user = connection.execute(
-            "SELECT id, username, employee_name, role FROM users WHERE id = ? AND is_active = 1",
+            """SELECT id, username, employee_name, role, employee_tag, phone_number
+               FROM users WHERE id = ? AND is_active = 1""",
             (user_id,),
         ).fetchone()
     if not user:
@@ -498,7 +649,14 @@ def get_user(user_id):
     return public_user
 
 
-def create_account(requester_id, username, employee_name, password, role="user"):
+def create_account(
+    requester_id,
+    username,
+    employee_name,
+    password,
+    role="user",
+    phone_number="",
+):
     username = username.strip()
     employee_name = employee_name.strip()
     if not USERNAME_PATTERN.fullmatch(username):
@@ -511,6 +669,10 @@ def create_account(requester_id, username, employee_name, password, role="user")
         raise ValueError("Password must be at least 8 characters.")
     if role not in ("admin", "user"):
         raise ValueError("Choose a valid account role.")
+    normalized_phone = _normalize_phone(phone_number, required=(role == "user"))
+    employee_tag = (
+        ("SO" if username.startswith("6") else "RM") if role == "user" else None
+    )
 
     with _connection(write=True) as connection:
         requester = connection.execute(
@@ -524,6 +686,11 @@ def create_account(requester_id, username, employee_name, password, role="user")
             raise ValueError("Only administrators can create accounts.")
         if requester_role != "super_admin" and role != "user":
             raise ValueError("Only the super administrator can create administrators.")
+        if normalized_phone and connection.execute(
+            "SELECT 1 FROM users WHERE phone_number = ? AND is_active = 1",
+            (normalized_phone,),
+        ).fetchone():
+            raise ValueError("That WhatsApp number is already assigned to an account.")
         try:
             user_id = _insert_user(
                 connection,
@@ -532,6 +699,8 @@ def create_account(requester_id, username, employee_name, password, role="user")
                 password,
                 role,
                 requester_id,
+                normalized_phone,
+                employee_tag,
             )
         except Exception as error:
             if isinstance(error, sqlite3.IntegrityError) or getattr(
@@ -563,9 +732,12 @@ def list_users(requester_id):
             f"""
                  SELECT account.id, account.username, account.employee_name, account.role,
                      account.created_at, account.created_by_user_id,
+                     account.employee_tag, account.phone_number, account.assigned_rm_id,
+                     assigned_rm.employee_name AS assigned_rm_name,
                    creator.username AS created_by_username
                  FROM users AS account
                  LEFT JOIN users AS creator ON creator.id = account.created_by_user_id
+                 LEFT JOIN users AS assigned_rm ON assigned_rm.id = account.assigned_rm_id
             {where_clause}
                  ORDER BY account.role DESC, LOWER(account.username)
             """,
@@ -577,6 +749,422 @@ def list_users(requester_id):
         public_user["role"] = _effective_role(user)
         public_users.append(public_user)
     return public_users
+
+
+def _normalize_phone(phone_number, required=False):
+    phone_number = (phone_number or "").strip()
+    if not phone_number:
+        if required:
+            raise ValueError("Employee WhatsApp phone number is required.")
+        return None
+    if not re.fullmatch(r"\+[1-9]\d{7,14}", phone_number):
+        raise ValueError("Use an international phone number, for example +919876543210.")
+    return phone_number
+
+
+def update_employee_profile(requester_id, target_user_id, employee_tag=None, phone_number=None):
+    if employee_tag is not None and employee_tag not in EMPLOYEE_TAGS:
+        raise ValueError("Choose RM or SO as the employee role.")
+
+    with _connection(write=True) as connection:
+        requester = connection.execute(
+            "SELECT id, username, role FROM users WHERE id = ? AND is_active = 1",
+            (requester_id,),
+        ).fetchone()
+        target = connection.execute(
+            """SELECT id, username, role, created_by_user_id, employee_tag,
+                      phone_number FROM users WHERE id = ? AND is_active = 1""",
+            (target_user_id,),
+        ).fetchone()
+        if not requester:
+            raise ValueError("The administrator account is no longer available.")
+        if not target or target["role"] != "user":
+            raise ValueError("Only active employee accounts can be updated.")
+
+        requester_role = _effective_role(requester)
+        if requester_role == "super_admin":
+            allowed = True
+        elif requester_role == "admin":
+            allowed = target["created_by_user_id"] == requester_id
+        else:
+            allowed = False
+        if not allowed:
+            raise ValueError("You can only update employees in your administration scope.")
+
+        new_phone = (
+            _normalize_phone(phone_number, required=True)
+            if phone_number is not None
+            else target["phone_number"]
+        )
+        if new_phone and connection.execute(
+            """SELECT 1 FROM users
+               WHERE phone_number = ? AND is_active = 1 AND id != ?""",
+            (new_phone, target_user_id),
+        ).fetchone():
+            raise ValueError("That WhatsApp number is already assigned to another account.")
+        new_tag = employee_tag or target["employee_tag"]
+        if requester_role != "super_admin" and phone_number is not None:
+            raise ValueError("Only the super administrator can update phone numbers.")
+        if new_tag == "SO" and target["employee_tag"] == "RM":
+            assigned_employees = connection.execute(
+                """SELECT 1 FROM users
+                   WHERE assigned_rm_id = ? AND is_active = 1 LIMIT 1""",
+                (target_user_id,),
+            ).fetchone()
+            if assigned_employees:
+                raise ValueError(
+                    "Reassign this RM's SO employees before changing the employee tag."
+                )
+        connection.execute(
+            """UPDATE users SET employee_tag = ?, phone_number = ?,
+               assigned_rm_id = CASE WHEN ? = 'SO' THEN assigned_rm_id ELSE NULL END
+               WHERE id = ?""",
+            (new_tag, new_phone, new_tag, target_user_id),
+        )
+
+
+def assign_so_to_rm(requester_id, so_user_id, rm_user_id):
+    with _connection(write=True) as connection:
+        requester = connection.execute(
+            "SELECT id, username, role FROM users WHERE id = ? AND is_active = 1",
+            (requester_id,),
+        ).fetchone()
+        if not requester or _effective_role(requester) not in ("admin", "super_admin"):
+            raise ValueError("Only administrators can assign an SO to an RM.")
+        so_user = connection.execute(
+            """SELECT id, role, employee_tag, created_by_user_id
+               FROM users WHERE id = ? AND is_active = 1""",
+            (so_user_id,),
+        ).fetchone()
+        rm_user = connection.execute(
+            """SELECT id, role, employee_tag, created_by_user_id
+               FROM users WHERE id = ? AND is_active = 1""",
+            (rm_user_id,),
+        ).fetchone()
+        if not so_user or so_user["role"] != "user" or so_user["employee_tag"] != "SO":
+            raise ValueError("Select an active SO employee.")
+        if not rm_user or rm_user["role"] != "user" or rm_user["employee_tag"] != "RM":
+            raise ValueError("Select an active RM employee.")
+        if _effective_role(requester) != "super_admin":
+            if (
+                so_user["created_by_user_id"] != requester_id
+                or rm_user["created_by_user_id"] != requester_id
+            ):
+                raise ValueError("Both employees must belong to your administration scope.")
+        connection.execute(
+            "UPDATE users SET assigned_rm_id = ? WHERE id = ?",
+            (rm_user_id, so_user_id),
+        )
+
+
+def get_available_records(employee_id, stages=None):
+    with _connection() as connection:
+        employee = connection.execute(
+            """SELECT id, role, employee_tag FROM users
+               WHERE id = ? AND is_active = 1""",
+            (employee_id,),
+        ).fetchone()
+        if not employee or employee["role"] != "user":
+            raise ValueError("The employee account is no longer available.")
+        query = f"SELECT {RECORD_COLUMNS} FROM records WHERE user_id = ?"
+        parameters = [employee_id]
+        if employee["employee_tag"] == "RM":
+            query = (
+                f"SELECT {RECORD_COLUMNS} FROM records WHERE "
+                "(user_id = ? OR user_id IN "
+                "(SELECT id FROM users WHERE assigned_rm_id = ? AND is_active = 1))"
+            )
+            parameters = [employee_id, employee_id]
+        if stages:
+            placeholders = ", ".join("?" for _ in stages)
+            query += f" AND stage IN ({placeholders})"
+            parameters.extend(stages)
+        query += " ORDER BY entry_date DESC, id DESC"
+        records = connection.execute(query, parameters).fetchall()
+    return [dict(record) for record in records]
+
+
+def get_owned_records(employee_id, stages=None):
+    with _connection() as connection:
+        employee = connection.execute(
+            """SELECT id, role FROM users
+               WHERE id = ? AND is_active = 1""",
+            (employee_id,),
+        ).fetchone()
+        if not employee or employee["role"] != "user":
+            raise ValueError("The employee account is no longer available.")
+        query = f"SELECT {RECORD_COLUMNS} FROM records WHERE user_id = ?"
+        parameters = [employee_id]
+        if stages:
+            placeholders = ", ".join("?" for _ in stages)
+            query += f" AND stage IN ({placeholders})"
+            parameters.extend(stages)
+        query += " ORDER BY entry_date DESC, id DESC"
+        records = connection.execute(query, parameters).fetchall()
+    return [dict(record) for record in records]
+
+
+def update_proposal(requester_id, record_id, stage=None, loan_amount=None):
+    if stage is not None and stage not in PROPOSAL_STAGES:
+        raise ValueError("Choose a valid proposal stage.")
+    if loan_amount is not None and (
+        not math.isfinite(float(loan_amount)) or loan_amount < 0
+    ):
+        raise ValueError("Loan amount must be a finite non-negative number.")
+    with _connection(write=True) as connection:
+        requester = connection.execute(
+            """SELECT id, role FROM users
+               WHERE id = ? AND is_active = 1""",
+            (requester_id,),
+        ).fetchone()
+        record = connection.execute(
+            "SELECT id, user_id, stage FROM records WHERE id = ?",
+            (record_id,),
+        ).fetchone()
+        if not requester or requester["role"] != "user":
+            raise ValueError("Only employees can update proposals.")
+        if not record:
+            raise ValueError("That proposal no longer exists.")
+        if record["user_id"] != requester_id:
+            raise ValueError("You can only update your own proposals.")
+
+        if stage is not None:
+            current_index = PROPOSAL_STAGES.index(record["stage"])
+            target_index = PROPOSAL_STAGES.index(stage)
+            if target_index != current_index and target_index != current_index + 1:
+                raise ValueError("Move proposals only to the next stage in the workflow.")
+        assignments = []
+        parameters = []
+        if stage is not None and stage != record["stage"]:
+            assignments.extend(("stage = ?", "stage_updated_at = ?"))
+            parameters.extend(
+                (stage, datetime.now(APP_TIMEZONE).isoformat(timespec="seconds"))
+            )
+        if loan_amount is not None:
+            assignments.append("loan_amount = ?")
+            parameters.append(loan_amount)
+        if assignments:
+            parameters.append(record_id)
+            connection.execute(
+                f"UPDATE records SET {', '.join(assignments)} WHERE id = ?",
+                parameters,
+            )
+
+
+def save_commitment_response(employee_id, commitment_type, answer, record_ids=()):
+    if commitment_type not in COMMITMENT_TYPES or answer not in ("Yes", "No"):
+        raise ValueError("Select a valid commitment type and Yes/No answer.")
+    today = datetime.now(APP_TIMEZONE).date().isoformat()
+    now = datetime.now(APP_TIMEZONE).isoformat(timespec="seconds")
+    with _connection(write=True) as connection:
+        employee = connection.execute(
+            "SELECT id, role, employee_tag FROM users WHERE id = ? AND is_active = 1",
+            (employee_id,),
+        ).fetchone()
+        if not employee or employee["role"] != "user":
+            raise ValueError("The employee account is no longer available.")
+        if answer == "No" and record_ids:
+            raise ValueError("A No response cannot include proposal selections.")
+        if answer == "Yes" and not record_ids:
+            raise ValueError("Select at least one proposal for a Yes commitment.")
+
+        eligible_stages = (
+            ("Yet to login",) if commitment_type == "Login" else ("SUD",)
+        )
+        for record_id in record_ids:
+            if commitment_type == "Login":
+                eligible = connection.execute(
+                    """SELECT id FROM records
+                       WHERE id = ? AND stage = ? AND user_id = ?""",
+                    (record_id, eligible_stages[0], employee_id),
+                ).fetchone()
+                if not eligible:
+                    raise ValueError(
+                        "Login commitments can only use your own Yet to login proposals."
+                    )
+                continue
+            eligible = connection.execute(
+                """SELECT r.id FROM records AS r
+                   LEFT JOIN users AS so ON so.id = r.user_id
+                   WHERE r.id = ? AND r.stage IN ({})
+                     AND (r.user_id = ? OR
+                       (? = 'RM' AND so.assigned_rm_id = ?))""".format(
+                    ", ".join("?" for _ in eligible_stages)
+                ),
+                (record_id, *eligible_stages, employee_id, employee["employee_tag"], employee_id),
+            ).fetchone()
+            if not eligible:
+                raise ValueError("A selected proposal is unavailable or at the wrong stage.")
+
+        connection.execute(
+            """INSERT INTO commitment_responses
+               (employee_user_id, commitment_type, commitment_date, answer, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(employee_user_id, commitment_type, commitment_date)
+               DO UPDATE SET answer = excluded.answer, updated_at = excluded.updated_at""",
+            (employee_id, commitment_type, today, answer, now),
+        )
+        connection.execute(
+            """DELETE FROM commitments
+               WHERE employee_user_id = ? AND commitment_type = ? AND commitment_date = ?""",
+            (employee_id, commitment_type, today),
+        )
+        if answer == "Yes":
+            for record_id in dict.fromkeys(record_ids):
+                connection.execute(
+                    """INSERT INTO commitments
+                       (employee_user_id, record_id, commitment_type, commitment_date, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (employee_id, record_id, commitment_type, today, now),
+                )
+
+
+def get_daily_commitments(admin_id, commitment_date=None):
+    commitment_date = commitment_date or datetime.now(APP_TIMEZONE).date().isoformat()
+    with _connection() as connection:
+        admin = connection.execute(
+            "SELECT id, username, role FROM users WHERE id = ? AND is_active = 1",
+            (admin_id,),
+        ).fetchone()
+        if not admin or _effective_role(admin) not in ("admin", "super_admin"):
+            raise ValueError("Only administrators can view commitment reports.")
+        parameters = [commitment_date]
+        scope = ""
+        if _effective_role(admin) != "super_admin":
+            scope = "AND (employee.created_by_user_id = ? OR employee.assigned_rm_id IN (SELECT id FROM users WHERE created_by_user_id = ?))"
+            parameters.extend((admin_id, admin_id))
+        rows = connection.execute(
+            f"""
+            SELECT employee.employee_name AS "Employee name",
+                   employee.employee_tag AS "Role",
+                   response.commitment_type AS "Commitment type",
+                   response.answer AS "Answer",
+                   record.customer_name AS "Customer",
+                   record.stage AS "Stage",
+                   record.loan_amount AS "Loan amount",
+                   record.employee_name AS "Proposal owner"
+            FROM commitment_responses AS response
+            JOIN users AS employee ON employee.id = response.employee_user_id
+            LEFT JOIN commitments AS commitment
+              ON commitment.employee_user_id = response.employee_user_id
+             AND commitment.commitment_type = response.commitment_type
+             AND commitment.commitment_date = response.commitment_date
+            LEFT JOIN records AS record ON record.id = commitment.record_id
+            WHERE response.commitment_date = ? {scope}
+            ORDER BY employee.employee_name, response.commitment_type, record.customer_name
+            """,
+            parameters,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_whatsapp_employees():
+    with _connection() as connection:
+        rows = connection.execute(
+            """SELECT id, employee_name, phone_number FROM users
+               WHERE role = 'user' AND is_active = 1 AND phone_number IS NOT NULL
+               ORDER BY employee_name"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_employee_by_phone(phone_number):
+    normalized_phone = _normalize_phone(phone_number, required=True)
+    with _connection() as connection:
+        row = connection.execute(
+            """SELECT id, employee_name, employee_tag FROM users
+               WHERE phone_number = ? AND role = 'user' AND is_active = 1""",
+            (normalized_phone,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_whatsapp_session(employee_id, state, payload=None):
+    import json
+
+    with _connection(write=True) as connection:
+        connection.execute(
+            """INSERT INTO whatsapp_sessions
+               (employee_user_id, state, payload, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(employee_user_id) DO UPDATE SET
+               state = excluded.state, payload = excluded.payload,
+               updated_at = excluded.updated_at""",
+            (
+                employee_id,
+                state,
+                json.dumps(payload or {}),
+                datetime.now(APP_TIMEZONE).isoformat(timespec="seconds"),
+            ),
+        )
+
+
+def get_whatsapp_session(employee_id):
+    import json
+
+    with _connection() as connection:
+        row = connection.execute(
+            """SELECT state, payload FROM whatsapp_sessions
+               WHERE employee_user_id = ?""",
+            (employee_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {"state": row["state"], "payload": json.loads(row["payload"])}
+
+
+def clear_whatsapp_session(employee_id):
+    with _connection(write=True) as connection:
+        connection.execute(
+            "DELETE FROM whatsapp_sessions WHERE employee_user_id = ?",
+            (employee_id,),
+        )
+
+
+def update_admin_phone(requester_id, target_admin_id, phone_number):
+    normalized_phone = _normalize_phone(phone_number, required=True)
+    with _connection(write=True) as connection:
+        requester = connection.execute(
+            "SELECT id, username, role FROM users WHERE id = ? AND is_active = 1",
+            (requester_id,),
+        ).fetchone()
+        target = connection.execute(
+            "SELECT id, role FROM users WHERE id = ? AND is_active = 1",
+            (target_admin_id,),
+        ).fetchone()
+        if not requester or _effective_role(requester) != "super_admin":
+            raise ValueError("Only the super administrator can update administrator numbers.")
+        if not target or target["role"] != "admin":
+            raise ValueError("Select an active administrator account.")
+        if connection.execute(
+            """SELECT 1 FROM users
+               WHERE phone_number = ? AND is_active = 1 AND id != ?""",
+            (normalized_phone, target_admin_id),
+        ).fetchone():
+            raise ValueError("That WhatsApp number is already assigned to another account.")
+        connection.execute(
+            "UPDATE users SET phone_number = ? WHERE id = ?",
+            (normalized_phone, target_admin_id),
+        )
+
+
+def list_whatsapp_admins():
+    with _connection() as connection:
+        admins = connection.execute(
+            """SELECT id, employee_name, phone_number FROM users
+               WHERE role = 'admin' AND is_active = 1 AND phone_number IS NOT NULL
+               ORDER BY id"""
+        ).fetchall()
+    return [dict(admin) for admin in admins]
+
+
+def get_super_admin_id():
+    with _connection() as connection:
+        admin = connection.execute(
+            "SELECT id FROM users WHERE LOWER(username) = LOWER(?) AND is_active = 1",
+            (SUPER_ADMIN_USERNAME,),
+        ).fetchone()
+    return admin["id"] if admin else None
 
 
 def delete_user(user_id, requester_id):
@@ -640,9 +1228,12 @@ def add_record(
     mandal,
     district,
     remarks,
+    loan_amount=0,
 ):
     if remarks not in REMARK_OPTIONS:
         raise ValueError("Please select a valid customer remark.")
+    if not math.isfinite(float(loan_amount)) or loan_amount < 0:
+        raise ValueError("Loan amount must be a finite non-negative number.")
     with _connection(write=True) as connection:
         user = connection.execute(
             """SELECT employee_name, created_by_user_id
@@ -656,8 +1247,8 @@ def add_record(
             INSERT INTO records (
                 user_id, admin_owner_id, employee_name, entry_date, logged_time,
                 customer_name, contact_number, acres, village, mandal, district,
-                remarks
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                remarks, loan_amount
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -672,11 +1263,13 @@ def add_record(
                 mandal,
                 district,
                 remarks,
+                loan_amount,
             ),
         )
 
 
 RECORD_COLUMNS = """
+    records.id AS "Proposal ID",
     entry_date AS "Entry Date",
     logged_time AS "Logged Time",
     employee_name AS "Employee Name",
@@ -686,17 +1279,15 @@ RECORD_COLUMNS = """
     village AS "Village",
     mandal AS "Mandal",
     district AS "District",
-    remarks AS "Remarks"
+    remarks AS "Remarks",
+    stage AS "Stage",
+    loan_amount AS "Loan Amount",
+    stage_updated_at AS "Stage Updated At"
 """
 
 
 def get_user_records(user_id):
-    with _connection() as connection:
-        records = connection.execute(
-            f"SELECT {RECORD_COLUMNS} FROM records WHERE user_id = ? ORDER BY entry_date DESC, id DESC",
-            (user_id,),
-        ).fetchall()
-    return [dict(record) for record in records]
+    return get_available_records(user_id)
 
 
 def get_admin_records(admin_id):
@@ -743,8 +1334,24 @@ def migrate_sqlite_to_postgres(source_path=None):
         record_columns = {
             row["name"] for row in source.execute("PRAGMA table_info(records)")
         }
+        source_tables = {
+            row["name"]
+            for row in source.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
         users = source.execute("SELECT * FROM users ORDER BY id").fetchall()
         records = source.execute("SELECT * FROM records ORDER BY id").fetchall()
+        commitments = (
+            source.execute("SELECT * FROM commitments ORDER BY id").fetchall()
+            if "commitments" in source_tables
+            else ()
+        )
+        commitment_responses = (
+            source.execute("SELECT * FROM commitment_responses").fetchall()
+            if "commitment_responses" in source_tables
+            else ()
+        )
 
     super_admin = next(
         (
@@ -791,8 +1398,9 @@ def migrate_sqlite_to_postgres(source_path=None):
                 """
                 INSERT INTO users (
                     id, username, employee_name, password_salt, password_hash,
-                    role, created_at, created_by_user_id, is_active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    role, created_at, created_by_user_id, is_active, phone_number,
+                    employee_tag, assigned_rm_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user["id"],
@@ -804,6 +1412,17 @@ def migrate_sqlite_to_postgres(source_path=None):
                     user["created_at"],
                     created_by_user_id,
                     user["is_active"] if "is_active" in user_columns else 1,
+                    user["phone_number"] if "phone_number" in user_columns else None,
+                    (
+                        user["employee_tag"]
+                        if "employee_tag" in user_columns
+                        else "SO" if user["username"].startswith("6") else "RM"
+                    )
+                    if user["role"] == "user"
+                    else None,
+                    user["assigned_rm_id"]
+                    if "assigned_rm_id" in user_columns
+                    else None,
                 ),
             )
 
@@ -825,8 +1444,8 @@ def migrate_sqlite_to_postgres(source_path=None):
                 INSERT INTO records (
                     id, user_id, admin_owner_id, employee_name, entry_date,
                     logged_time, customer_name, contact_number, acres, village,
-                    mandal, district, remarks
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    mandal, district, remarks, stage, loan_amount, stage_updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
@@ -842,6 +1461,51 @@ def migrate_sqlite_to_postgres(source_path=None):
                     record["mandal"],
                     record["district"],
                     remark,
+                    record["stage"]
+                    if "stage" in record_columns
+                    and record["stage"] in PROPOSAL_STAGES
+                    else "Yet to login",
+                    record["loan_amount"]
+                    if "loan_amount" in record_columns
+                    else 0,
+                    record["stage_updated_at"]
+                    if "stage_updated_at" in record_columns
+                    else "",
+                ),
+            )
+
+        for commitment in commitments:
+            connection.execute(
+                """INSERT INTO commitments
+                   (id, employee_user_id, record_id, commitment_type,
+                    commitment_date, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                tuple(
+                    commitment[key]
+                    for key in (
+                        "id",
+                        "employee_user_id",
+                        "record_id",
+                        "commitment_type",
+                        "commitment_date",
+                        "created_at",
+                    )
+                ),
+            )
+        for response in commitment_responses:
+            connection.execute(
+                """INSERT INTO commitment_responses
+                   (employee_user_id, commitment_type, commitment_date, answer, updated_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                tuple(
+                    response[key]
+                    for key in (
+                        "employee_user_id",
+                        "commitment_type",
+                        "commitment_date",
+                        "answer",
+                        "updated_at",
+                    )
                 ),
             )
 

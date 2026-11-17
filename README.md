@@ -40,7 +40,24 @@ such as a persistent volume when deploying.
 - Administrators can create and delete only the employees they created, and can
    view or download only those employees' records. They can also reset the
    passwords of those employees.
-- Employees can view only their own records and cannot download records.
+- Employees are tagged SO when their username/employee ID starts with `6`;
+  other employee IDs default to RM. Administrators can change the tag and
+  assign SO employees to an RM.
+- Employees can view and download their own proposals. RMs can also view,
+  download proposals belonging to SO employees assigned to them, but can update
+  only their own proposals. SO employees can update only their own proposals.
+- Employee onboarding requires an international-format WhatsApp number. The
+  super administrator can update employee numbers and administrator report
+  numbers from Accounts.
+- Each proposal has a loan amount and a stage: Yet to login, Login, Pending for
+  Sanction, SUD, or Disbursement. Employees can update the loan amount and move
+  a proposal only to the next stage.
+- The Commitments for the day tab records Login and Disbursement Yes/No
+  commitments. Login commitments select a Yet to login proposal and update it
+  to Login; disbursement commitments can include one or more SUD proposals.
+- The Meta WhatsApp bot requests employee commitments at 9:30 AM India time
+  and sends cluster commitment and end-of-day summaries to administrators at
+  9:30 AM and 8:00 PM.
 - Every account can change its own password after confirming its current
   password. From the Accounts tab, the super administrator can set a new
   password for any administrator or employee; administrators can reset
@@ -131,3 +148,47 @@ overwriting either; set `DATA_DB_PATH` to the database you intend to use.
 
 After deployment, the Streamlit Cloud app URL remains available independently
 of this Codespace. Keep the managed database active and retain its backups.
+
+## WhatsApp bot
+
+The WhatsApp bot is a separate long-running service that uses the same
+`DATABASE_URL` as the Streamlit app. Deploy it on a persistent host with a
+public HTTPS URL; do not rely on the Streamlit app process to receive Meta
+webhooks or run scheduled messages.
+
+Configure these environment variables on the bot host:
+
+```text
+DATABASE_URL=<the same persistent PostgreSQL URL as the app>
+WHATSAPP_GRAPH_API_VERSION=<Meta Graph API version enabled for your app>
+WHATSAPP_PHONE_NUMBER_ID=<Meta WhatsApp Business phone number ID>
+WHATSAPP_ACCESS_TOKEN=<Meta access token>
+WHATSAPP_VERIFY_TOKEN=<a private webhook verification token>
+WHATSAPP_APP_SECRET=<Meta app secret used to validate webhook signatures>
+WHATSAPP_MORNING_TEMPLATE=<approved employee morning template name>
+WHATSAPP_ADMIN_MORNING_TEMPLATE=<approved admin morning report template name>
+WHATSAPP_EOD_TEMPLATE=<approved admin end-of-day template name>
+```
+
+Create and get Meta approval for three WhatsApp templates in `en_US`. Each
+template must have one body text placeholder; the bot supplies the prompt or
+report as that parameter. Configure the Meta webhook URL as
+`https://<bot-host>/webhook`, set the matching verify token, and subscribe to
+WhatsApp message events. Set the webhook app secret so incoming request
+signatures are validated. Add international-format employee and administrator
+numbers in Accounts.
+
+Install dependencies and run the bot service:
+
+```sh
+uv sync
+uv run uvicorn whatsapp_bot:app --host 0.0.0.0 --port 8000
+```
+
+The employee template starts the login commitment flow. Employees can answer
+with `LOGIN YES` or `LOGIN NO`, select a proposal by ID, enter the loan amount,
+then answer `DISBURSEMENT YES` or `DISBURSEMENT NO` and select one or more SUD
+proposal IDs. During an open WhatsApp conversation they can also send
+`STAGE <proposal ID> <stage>` or `AMOUNT <proposal ID> <amount>`. Meta requires
+approved templates for scheduled messages outside the customer-service
+conversation window.

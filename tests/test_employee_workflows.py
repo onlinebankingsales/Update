@@ -2,11 +2,13 @@ import os
 import sqlite3
 import tempfile
 from contextlib import closing
+from datetime import datetime
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import data_store
+import whatsapp_bot
 
 
 class EmployeeWorkflowTests(unittest.TestCase):
@@ -202,6 +204,99 @@ class EmployeeWorkflowTests(unittest.TestCase):
         self.assertIsNone(employee["phone_number"])
         self.assertEqual(record["stage"], "Yet to login")
         self.assertEqual(record["loan_amount"], 0)
+
+    def test_whatsapp_report_snapshots_are_upserted_per_day_and_period(self):
+        data_store.save_whatsapp_report_snapshot(
+            self.admin_id, "2026-11-17", "morning", "Initial report"
+        )
+        self.assertEqual(
+            data_store.get_whatsapp_report_snapshot(
+                self.admin_id, "2026-11-17", "morning"
+            ),
+            "Initial report",
+        )
+
+        data_store.save_whatsapp_report_snapshot(
+            self.admin_id, "2026-11-17", "morning", "Updated report"
+        )
+        self.assertEqual(
+            data_store.get_whatsapp_report_snapshot(
+                self.admin_id, "2026-11-17", "morning"
+            ),
+            "Updated report",
+        )
+        self.assertIsNone(
+            data_store.get_whatsapp_report_snapshot(
+                self.admin_id, "2026-11-17", "evening"
+            )
+        )
+
+    def test_consolidated_report_is_sent_only_when_content_changes(self):
+        admin = {
+            "id": self.admin_id,
+            "employee_name": "Cluster Admin",
+            "phone_number": "+919000000000",
+        }
+        with (
+            patch.object(whatsapp_bot, "list_whatsapp_admins", return_value=[admin]),
+            patch.object(whatsapp_bot, "get_admin_records", return_value=[]),
+            patch.object(whatsapp_bot, "get_daily_commitments", return_value=[]),
+            patch.object(whatsapp_bot, "_render_cluster_report", return_value="Report"),
+            patch.object(
+                whatsapp_bot,
+                "get_whatsapp_report_snapshot",
+                return_value="Report",
+            ),
+            patch.object(whatsapp_bot, "_send_report") as send_report,
+            patch.object(whatsapp_bot, "save_whatsapp_report_snapshot"),
+        ):
+            whatsapp_bot.send_consolidated_updates("morning", "morning-template")
+        send_report.assert_not_called()
+
+        with (
+            patch.object(whatsapp_bot, "list_whatsapp_admins", return_value=[admin]),
+            patch.object(whatsapp_bot, "get_admin_records", return_value=[]),
+            patch.object(whatsapp_bot, "get_daily_commitments", return_value=[]),
+            patch.object(whatsapp_bot, "_render_cluster_report", return_value="Report"),
+            patch.object(
+                whatsapp_bot,
+                "get_whatsapp_report_snapshot",
+                return_value="Previous report",
+            ),
+            patch.object(whatsapp_bot, "_send_report") as send_report,
+            patch.object(whatsapp_bot, "save_whatsapp_report_snapshot") as save_report,
+        ):
+            whatsapp_bot.send_consolidated_updates("morning", "morning-template")
+        send_report.assert_called_once()
+        save_report.assert_called_once()
+
+    def test_expired_whatsapp_resubmission_is_rejected(self):
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 11, 17, 10, 1, tzinfo=tz)
+
+        with (
+            patch.object(whatsapp_bot, "datetime", FixedDatetime),
+            patch.object(
+                whatsapp_bot,
+                "get_whatsapp_session",
+                return_value={
+                    "state": "resubmit",
+                    "payload": {"deadline": "2026-11-17T10:00:00+05:30"},
+                },
+            ),
+            patch.object(whatsapp_bot, "clear_whatsapp_session") as clear_session,
+            patch.object(whatsapp_bot, "send_text") as send_text,
+            patch.object(whatsapp_bot, "save_commitment_response") as save_response,
+        ):
+            whatsapp_bot._handle_employee_message(
+                self.rm_id, "+919000000001", "LOGIN NO"
+            )
+
+        clear_session.assert_called_once_with(self.rm_id)
+        save_response.assert_not_called()
+        send_text.assert_called_once()
 
 
 if __name__ == "__main__":

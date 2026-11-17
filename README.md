@@ -55,9 +55,11 @@ such as a persistent volume when deploying.
 - The Commitments for the day tab records Login and Disbursement Yes/No
   commitments. Login commitments select a Yet to login proposal and update it
   to Login; disbursement commitments can include one or more SUD proposals.
-- The Meta WhatsApp bot requests employee commitments at 9:30 AM India time
-  and sends cluster commitment and end-of-day summaries to administrators at
-  9:30 AM and 8:00 PM.
+- The Meta WhatsApp bot requests employee commitments at 9:30 AM India time.
+  Employees can resubmit until 10:00 AM; administrators receive an initial
+  9:30 AM report and a 10:00 AM consolidated update only when report data has
+  changed. The same process runs at 8:00 PM, with employee resubmissions until
+  8:30 PM and an 8:30 PM administrator update only when data has changed.
 - Every account can change its own password after confirming its current
   password. From the Accounts tab, the super administrator can set a new
   password for any administrator or employee; administrators can reset
@@ -167,12 +169,14 @@ WHATSAPP_VERIFY_TOKEN=<a private webhook verification token>
 WHATSAPP_APP_SECRET=<Meta app secret used to validate webhook signatures>
 WHATSAPP_MORNING_TEMPLATE=<approved employee morning template name>
 WHATSAPP_ADMIN_MORNING_TEMPLATE=<approved admin morning report template name>
+WHATSAPP_EOD_EMPLOYEE_TEMPLATE=<approved employee evening resubmission template name>
 WHATSAPP_EOD_TEMPLATE=<approved admin end-of-day template name>
 ```
 
-Create and get Meta approval for three WhatsApp templates in `en_US`. Each
+Create and get Meta approval for four WhatsApp templates in `en_US`. Each
 template must have one body text placeholder; the bot supplies the prompt or
-report as that parameter. Configure the Meta webhook URL as
+report as that parameter. The morning employee and evening employee templates
+start or reopen the commitment flow. Configure the Meta webhook URL as
 `https://<bot-host>/webhook`, set the matching verify token, and subscribe to
 WhatsApp message events. Set the webhook app secret so incoming request
 signatures are validated. Add international-format employee and administrator
@@ -191,4 +195,6 @@ then answer `DISBURSEMENT YES` or `DISBURSEMENT NO` and select one or more SUD
 proposal IDs. During an open WhatsApp conversation they can also send
 `STAGE <proposal ID> <stage>` or `AMOUNT <proposal ID> <amount>`. Meta requires
 approved templates for scheduled messages outside the customer-service
-conversation window.
+conversation window. Report snapshots are stored in the shared database so
+the 10:00 AM and 8:30 PM reports are sent only when their report content has
+changed since the initial report.

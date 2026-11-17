@@ -277,6 +277,14 @@ def _initialize_sqlite_schema(connection):
             payload TEXT NOT NULL DEFAULT '{}',
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS whatsapp_report_snapshots (
+            admin_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            report_date TEXT NOT NULL,
+            report_type TEXT NOT NULL CHECK (report_type IN ('morning', 'evening')),
+            report_text TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(admin_user_id, report_date, report_type)
+        );
         CREATE INDEX IF NOT EXISTS records_user_date_idx
             ON records(user_id, entry_date, id);
         """
@@ -468,6 +476,18 @@ def _initialize_postgres_schema(connection):
             state TEXT NOT NULL,
             payload TEXT NOT NULL DEFAULT '{}',
             updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS whatsapp_report_snapshots (
+            admin_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            report_date TEXT NOT NULL,
+            report_type TEXT NOT NULL CHECK (report_type IN ('morning', 'evening')),
+            report_text TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(admin_user_id, report_date, report_type)
         )
         """
     )
@@ -1118,6 +1138,39 @@ def clear_whatsapp_session(employee_id):
         connection.execute(
             "DELETE FROM whatsapp_sessions WHERE employee_user_id = ?",
             (employee_id,),
+        )
+
+
+def get_whatsapp_report_snapshot(admin_id, report_date, report_type):
+    if report_type not in ("morning", "evening"):
+        raise ValueError("Choose a valid WhatsApp report period.")
+    with _connection() as connection:
+        row = connection.execute(
+            """SELECT report_text FROM whatsapp_report_snapshots
+               WHERE admin_user_id = ? AND report_date = ? AND report_type = ?""",
+            (admin_id, report_date, report_type),
+        ).fetchone()
+    return row["report_text"] if row else None
+
+
+def save_whatsapp_report_snapshot(admin_id, report_date, report_type, report_text):
+    if report_type not in ("morning", "evening"):
+        raise ValueError("Choose a valid WhatsApp report period.")
+    with _connection(write=True) as connection:
+        connection.execute(
+            """INSERT INTO whatsapp_report_snapshots
+               (admin_user_id, report_date, report_type, report_text, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(admin_user_id, report_date, report_type)
+               DO UPDATE SET report_text = excluded.report_text,
+                             updated_at = excluded.updated_at""",
+            (
+                admin_id,
+                report_date,
+                report_type,
+                report_text,
+                datetime.now(APP_TIMEZONE).isoformat(timespec="seconds"),
+            ),
         )
 
 

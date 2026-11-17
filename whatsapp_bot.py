@@ -8,7 +8,7 @@ import re
 import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 
@@ -21,9 +21,11 @@ from data_store import (
     get_employee_by_phone,
     get_owned_records,
     get_whatsapp_session,
+    get_whatsapp_report_snapshot,
     list_whatsapp_admins,
     list_whatsapp_employees,
     save_commitment_response,
+    save_whatsapp_report_snapshot,
     set_whatsapp_session,
     update_proposal,
 )
@@ -37,6 +39,9 @@ APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET", "").strip()
 MORNING_TEMPLATE = os.environ.get("WHATSAPP_MORNING_TEMPLATE", "").strip()
 ADMIN_MORNING_TEMPLATE = os.environ.get(
     "WHATSAPP_ADMIN_MORNING_TEMPLATE", ""
+).strip()
+EOD_EMPLOYEE_TEMPLATE = os.environ.get(
+    "WHATSAPP_EOD_EMPLOYEE_TEMPLATE", ""
 ).strip()
 EOD_TEMPLATE = os.environ.get("WHATSAPP_EOD_TEMPLATE", "").strip()
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +59,7 @@ def _required_configuration():
             ("WHATSAPP_APP_SECRET", APP_SECRET),
             ("WHATSAPP_MORNING_TEMPLATE", MORNING_TEMPLATE),
             ("WHATSAPP_ADMIN_MORNING_TEMPLATE", ADMIN_MORNING_TEMPLATE),
+            ("WHATSAPP_EOD_EMPLOYEE_TEMPLATE", EOD_EMPLOYEE_TEMPLATE),
             ("WHATSAPP_EOD_TEMPLATE", EOD_TEMPLATE),
         )
         if not value
@@ -129,6 +135,7 @@ def send_template(phone_number, template_name, content):
 
 def send_morning_prompts():
     today = datetime.now(APP_TIMEZONE).date().isoformat()
+    deadline = _commitment_deadline(time(10, 0))
     sent = 0
     for employee in list_whatsapp_employees():
         send_template(
@@ -137,7 +144,9 @@ def send_morning_prompts():
             f"Good morning. Please submit today's login and disbursement "
             f"commitments for {today}. Reply LOGIN YES or LOGIN NO.",
         )
-        set_whatsapp_session(employee["id"], "login_answer")
+        set_whatsapp_session(
+            employee["id"], "login_answer", {"deadline": deadline}
+        )
         sent += 1
     logger.info("Sent morning WhatsApp prompts to %s employees", sent)
     for admin in list_whatsapp_admins():
@@ -148,6 +157,19 @@ def send_morning_prompts():
             today,
         )
         _send_report(admin["phone_number"], ADMIN_MORNING_TEMPLATE, report)
+        save_whatsapp_report_snapshot(
+            admin["id"], today, "morning", report
+        )
+
+
+def _commitment_deadline(deadline_time):
+    now = datetime.now(APP_TIMEZONE)
+    return now.replace(
+        hour=deadline_time.hour,
+        minute=deadline_time.minute,
+        second=0,
+        microsecond=0,
+    ).isoformat()
 
 
 def _render_cluster_report(admin, records, commitments, today):
@@ -184,7 +206,8 @@ def _render_cluster_report(admin, records, commitments, today):
         lines.append("Commitments:")
         for item in commitments:
             proposal = (
-                f" - {item['Customer']} ({item['Proposal owner']})"
+                f" - {item['Customer']} ({item['Proposal owner']}), "
+                f"loan {float(item['Loan amount'] or 0):,.2f}"
                 if item["Customer"]
                 else ""
             )
@@ -224,8 +247,56 @@ def send_eod_reports():
         commitments = get_daily_commitments(admin["id"], today)
         report = _render_cluster_report(admin, records, commitments, today)
         _send_report(admin["phone_number"], EOD_TEMPLATE, report)
+        save_whatsapp_report_snapshot(
+            admin["id"], today, "evening", report
+        )
         sent += 1
     logger.info("Sent end-of-day WhatsApp reports to %s administrators", sent)
+    deadline = _commitment_deadline(time(20, 30))
+    for employee in list_whatsapp_employees():
+        send_template(
+            employee["phone_number"],
+            EOD_EMPLOYEE_TEMPLATE,
+            f"Good evening. Review or resubmit today's commitments by "
+            f"8:30 PM. Reply LOGIN YES or LOGIN NO.",
+        )
+        set_whatsapp_session(
+            employee["id"], "resubmit", {"deadline": deadline}
+        )
+
+
+def send_consolidated_updates(report_type, template_name):
+    today = datetime.now(APP_TIMEZONE).date().isoformat()
+    sent = 0
+    for admin in list_whatsapp_admins():
+        report = _render_cluster_report(
+            admin,
+            get_admin_records(admin["id"]),
+            get_daily_commitments(admin["id"], today),
+            today,
+        )
+        previous_report = get_whatsapp_report_snapshot(
+            admin["id"], today, report_type
+        )
+        if previous_report == report:
+            continue
+        heading = (
+            "Updated morning consolidated report"
+            if report_type == "morning"
+            else "Updated evening consolidated report"
+        )
+        _send_report(
+            admin["phone_number"], template_name, f"{heading}\n{report}"
+        )
+        save_whatsapp_report_snapshot(
+            admin["id"], today, report_type, report
+        )
+        sent += 1
+    logger.info(
+        "Sent %s changed consolidated reports to %s administrators",
+        report_type,
+        sent,
+    )
 
 
 def _available_proposals(employee_id, stage):
@@ -244,8 +315,10 @@ def _proposal_list(records):
     )
 
 
-def _start_disbursement_prompt(employee_id, phone_number):
-    set_whatsapp_session(employee_id, "disbursement_answer")
+def _start_disbursement_prompt(employee_id, phone_number, deadline):
+    set_whatsapp_session(
+        employee_id, "disbursement_answer", {"deadline": deadline}
+    )
     send_text(
         phone_number,
         "Will you commit to disburse today? Reply DISBURSEMENT YES or "
@@ -292,17 +365,46 @@ def _handle_employee_message(employee_id, phone_number, message_text):
         return
 
     normalized = message.upper()
+    if state == "resubmit":
+        if normalized in ("LOGIN YES", "LOGIN NO"):
+            state = "login_answer"
+            set_whatsapp_session(employee_id, state, payload)
+        elif normalized in ("DISBURSEMENT YES", "DISBURSEMENT NO"):
+            state = "disbursement_answer"
+            set_whatsapp_session(employee_id, state, payload)
+        else:
+            send_text(
+                phone_number,
+                "You can resubmit LOGIN YES/NO or DISBURSEMENT YES/NO "
+                "before the commitment window closes.",
+            )
+            return
+
+    deadline = payload.get("deadline")
+    if deadline and datetime.now(APP_TIMEZONE) > datetime.fromisoformat(deadline):
+        clear_whatsapp_session(employee_id)
+        send_text(phone_number, "The commitment resubmission window has closed.")
+        return
+
     if state == "login_answer":
         if normalized in ("LOGIN NO", "NO"):
             save_commitment_response(employee_id, "Login", "No")
-            _start_disbursement_prompt(employee_id, phone_number)
+            _start_disbursement_prompt(
+                employee_id, phone_number, payload.get("deadline")
+            )
         elif normalized in ("LOGIN YES", "YES"):
             proposals = _owned_proposals(employee_id, "Yet to login")
             if not proposals:
                 send_text(phone_number, "No Yet to login proposals are available.")
-                _start_disbursement_prompt(employee_id, phone_number)
+                _start_disbursement_prompt(
+                    employee_id, phone_number, payload.get("deadline")
+                )
                 return
-            set_whatsapp_session(employee_id, "login_select")
+            set_whatsapp_session(
+                employee_id,
+                "login_select",
+                {"deadline": payload.get("deadline")},
+            )
             send_text(
                 phone_number,
                 "Reply with one proposal ID to commit for login:\n"
@@ -320,7 +422,12 @@ def _handle_employee_message(employee_id, phone_number, message_text):
             send_text(phone_number, "That proposal is not available for login.")
             return
         set_whatsapp_session(
-            employee_id, "login_amount", {"proposal_id": proposal_id}
+            employee_id,
+            "login_amount",
+            {
+                "proposal_id": proposal_id,
+                "deadline": payload.get("deadline"),
+            },
         )
         send_text(
             phone_number,
@@ -343,19 +450,34 @@ def _handle_employee_message(employee_id, phone_number, message_text):
         update_proposal(
             employee_id, proposal_id, stage="Login", loan_amount=loan_amount
         )
-        _start_disbursement_prompt(employee_id, phone_number)
+        _start_disbursement_prompt(
+            employee_id, phone_number, payload.get("deadline")
+        )
     elif state == "disbursement_answer":
         if normalized in ("DISBURSEMENT NO", "NO"):
             save_commitment_response(employee_id, "Disbursement", "No")
-            clear_whatsapp_session(employee_id)
-            send_text(phone_number, "Today's commitments have been saved.")
+            set_whatsapp_session(
+                employee_id, "resubmit", {"deadline": payload.get("deadline")}
+            )
+            send_text(
+                phone_number,
+                "Today's commitments are saved. You can resubmit until "
+                + datetime.fromisoformat(payload["deadline"]).strftime("%I:%M %p")
+                + ".",
+            )
         elif normalized in ("DISBURSEMENT YES", "YES"):
             proposals = _available_proposals(employee_id, "SUD")
             if not proposals:
                 send_text(phone_number, "No SUD proposals are available.")
-                clear_whatsapp_session(employee_id)
+                set_whatsapp_session(
+                    employee_id, "resubmit", {"deadline": payload.get("deadline")}
+                )
                 return
-            set_whatsapp_session(employee_id, "disbursement_select")
+            set_whatsapp_session(
+                employee_id,
+                "disbursement_select",
+                {"deadline": payload.get("deadline")},
+            )
             send_text(
                 phone_number,
                 "Reply with one or more proposal IDs separated by commas:\n"
@@ -376,8 +498,15 @@ def _handle_employee_message(employee_id, phone_number, message_text):
         save_commitment_response(
             employee_id, "Disbursement", "Yes", proposal_ids
         )
-        clear_whatsapp_session(employee_id)
-        send_text(phone_number, "Today's commitments have been saved.")
+        set_whatsapp_session(
+            employee_id, "resubmit", {"deadline": payload.get("deadline")}
+        )
+        send_text(
+            phone_number,
+            "Today's commitments are saved. You can resubmit until "
+            + datetime.fromisoformat(payload["deadline"]).strftime("%I:%M %p")
+            + ".",
+        )
     else:
         send_text(
             phone_number,
@@ -416,7 +545,9 @@ def _handle_webhook_payload(payload):
 
 async def _scheduler():
     sent_morning = None
+    sent_morning_update = None
     sent_eod = None
+    sent_eod_update = None
     while True:
         now = datetime.now(APP_TIMEZONE)
         today = now.date()
@@ -429,12 +560,26 @@ async def _scheduler():
                 send_morning_prompts()
                 sent_morning = today
             if (
+                now.hour == 10
+                and now.minute in (0, 1)
+                and sent_morning_update != today
+            ):
+                send_consolidated_updates("morning", ADMIN_MORNING_TEMPLATE)
+                sent_morning_update = today
+            if (
                 now.hour == 20
                 and now.minute in (0, 1)
                 and sent_eod != today
             ):
                 send_eod_reports()
                 sent_eod = today
+            if (
+                now.hour == 20
+                and now.minute in (30, 31)
+                and sent_eod_update != today
+            ):
+                send_consolidated_updates("evening", EOD_TEMPLATE)
+                sent_eod_update = today
         except (RuntimeError, ValueError):
             logger.exception("Scheduled WhatsApp delivery failed")
         await asyncio.sleep(30)

@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from data_store import (
     PROPOSAL_STAGES,
     clear_whatsapp_session,
+    filter_proposals_by_text,
     get_admin_records,
     get_available_records,
     get_daily_commitments,
@@ -177,7 +178,7 @@ def _render_cluster_report(admin, records, commitments, today):
     achieved = [
         record
         for record in records
-        if record["Stage"] == "Disbursement"
+        if record["Stage"] == "Disbursed"
         and (record["Stage Updated At"] or "").startswith(today)
     ]
     employee_counts = {}
@@ -310,7 +311,8 @@ def _owned_proposals(employee_id, stage):
 def _proposal_list(records):
     return "\n".join(
         f"#{record['Proposal ID']} - {record['Customer Name']} "
-        f"({record['Employee Name']}, loan {record['Loan Amount']})"
+        f"({record['Contact Number']}, {record['Employee Name']}, "
+        f"loan {record['Loan Amount']})"
         for record in records
     )
 
@@ -348,7 +350,11 @@ def _handle_employee_message(employee_id, phone_number, message_text):
         if not stage:
             send_text(phone_number, "Unknown stage. Use one of: " + ", ".join(PROPOSAL_STAGES))
             return
-        update_proposal(employee_id, int(stage_command.group(1)), stage=stage)
+        try:
+            update_proposal(employee_id, int(stage_command.group(1)), stage=stage)
+        except ValueError as error:
+            send_text(phone_number, str(error))
+            return
         send_text(phone_number, "Proposal stage updated.")
         return
 
@@ -407,14 +413,30 @@ def _handle_employee_message(employee_id, phone_number, message_text):
             )
             send_text(
                 phone_number,
-                "Reply with one proposal ID to commit for login:\n"
+                "Reply with one proposal ID, or SEARCH <customer name or phone>:\n"
                 + _proposal_list(proposals),
             )
         else:
             send_text(phone_number, "Reply LOGIN YES or LOGIN NO.")
     elif state == "login_select":
+        search_command = re.fullmatch(
+            r"SEARCH\s+(.+)", message, flags=re.IGNORECASE
+        )
+        if search_command:
+            proposals = filter_proposals_by_text(
+                _owned_proposals(employee_id, "Yet to login"),
+                search_command.group(1),
+            )
+            if proposals:
+                send_text(phone_number, _proposal_list(proposals))
+            else:
+                send_text(phone_number, "No Yet to login proposals match that search.")
+            return
         if not message.isdigit():
-            send_text(phone_number, "Reply with one numeric proposal ID.")
+            send_text(
+                phone_number,
+                "Reply with one numeric proposal ID or SEARCH <customer name or phone>.",
+            )
             return
         proposal_id = int(message)
         proposals = _owned_proposals(employee_id, "Yet to login")

@@ -21,6 +21,7 @@ except StreamlitSecretNotFoundError:
 
 from data_store import (
     DATABASE_URL,
+    EMPLOYEE_STAGE_TRANSITIONS,
     EMPLOYEE_TAGS,
     PROPOSAL_STAGES,
     REMARK_OPTIONS,
@@ -31,9 +32,11 @@ from data_store import (
     change_own_password,
     create_account,
     delete_user,
+    filter_proposals_by_text,
     get_available_records,
     get_admin_records,
     get_daily_commitments,
+    get_mtd_performance,
     get_owned_records,
     get_user,
     get_user_records,
@@ -65,6 +68,129 @@ def sign_in():
 def sign_out():
     st.session_state.pop("authenticated_user_id", None)
     st.session_state.pop("login_error", None)
+
+
+def _render_admin_mtd_performance(admin_id, performance):
+    st.subheader("MTD performance")
+    st.caption(
+        "Counts include proposals that reached each stage this month. "
+        "Values use the proposal's current loan amount."
+    )
+    employees_by_id = {
+        employee["Employee ID"]: employee for employee in performance["employees"]
+    }
+    headings = (
+        "Employee Name",
+        "Logins (count)",
+        "Login Value",
+        "Disb no",
+        "Disb Volume",
+    )
+    for employee_role in EMPLOYEE_TAGS:
+        role_employees = [
+            employee
+            for employee in performance["employees"]
+            if employee["Employee Role"] == employee_role
+        ]
+        st.markdown(f"#### {employee_role}")
+        header_columns = st.columns((2.3, 1, 1.4, 1, 1.4))
+        for column, heading in zip(header_columns, headings):
+            column.markdown(f"**{heading}**")
+        for employee in role_employees:
+            columns = st.columns((2.3, 1, 1.4, 1, 1.4))
+            columns[0].write(employee["Employee Name"])
+            metric_buttons = (
+                ("Login", employee["Logins (count)"], f"{employee['Logins (count)']:,}"),
+                ("Login", employee["Login Value"], f"{employee['Login Value']:,.2f}"),
+                ("Disbursed", employee["Disb no"], f"{employee['Disb no']:,}"),
+                ("Disbursed", employee["Disb Volume"], f"{employee['Disb Volume']:,.2f}"),
+            )
+            for metric_index, (column, (stage, _, label)) in enumerate(
+                zip(columns[1:], metric_buttons)
+            ):
+                if column.button(
+                    label,
+                    key=f"mtd_{employee['Employee ID']}_{stage}_{metric_index}",
+                    width="stretch",
+                ):
+                    st.session_state["mtd_proposal_detail"] = {
+                        "employee_id": employee["Employee ID"],
+                        "stage": stage,
+                    }
+        if not role_employees:
+            st.info(f"No {employee_role} employees are available.")
+
+    selected_detail = st.session_state.get("mtd_proposal_detail")
+    if not selected_detail:
+        return
+    employee_id = selected_detail["employee_id"]
+    employee = employees_by_id.get(employee_id)
+    if not employee:
+        st.session_state.pop("mtd_proposal_detail", None)
+        return
+
+    stage = selected_detail["stage"]
+    detail_records = performance["details"].get(employee_id, {}).get(stage, [])
+    st.divider()
+    st.subheader(f"{employee['Employee Name']} · {stage} proposals")
+    if st.button("Close proposal details", key="close_mtd_proposal_detail"):
+        st.session_state.pop("mtd_proposal_detail", None)
+        st.rerun()
+    if not detail_records:
+        st.info("There are no proposals for this MTD metric.")
+        return
+
+    search_text = st.text_input(
+        "Search by customer name or phone number",
+        key="mtd_proposal_search",
+    )
+    matching_records = filter_proposals_by_text(detail_records, search_text)
+    if not matching_records:
+        st.info("No proposals match that search.")
+        return
+    st.dataframe(pd.DataFrame(matching_records), width="stretch", hide_index=True)
+
+    records_by_id = {
+        int(record["Proposal ID"]): record for record in matching_records
+    }
+    with st.form("mtd_admin_proposal_form"):
+        selected_record_id = st.selectbox(
+            "Proposal to correct",
+            options=list(records_by_id),
+            format_func=lambda record_id: (
+                f"#{record_id} · {records_by_id[record_id]['Customer Name']} · "
+                f"{records_by_id[record_id]['Contact Number']}"
+            ),
+        )
+        selected_record = records_by_id[selected_record_id]
+        corrected_stage = st.selectbox(
+            "Status",
+            options=PROPOSAL_STAGES,
+            index=PROPOSAL_STAGES.index(selected_record["Stage"]),
+        )
+        corrected_amount = st.number_input(
+            "Loan amount",
+            min_value=0.0,
+            value=float(selected_record["Loan Amount"] or 0),
+            step=10000.0,
+            format="%.2f",
+        )
+        correction_submitted = st.form_submit_button(
+            "Save proposal correction", width="stretch"
+        )
+    if correction_submitted:
+        try:
+            update_proposal(
+                admin_id,
+                selected_record_id,
+                stage=corrected_stage,
+                loan_amount=corrected_amount,
+            )
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            st.success("Proposal correction saved.")
+            st.rerun()
 
 
 def render_copyright_footer():
@@ -359,7 +485,7 @@ is_super_admin = current_user["role"] == "super_admin"
 is_admin = current_user["role"] in ("admin", "super_admin")
 role_label = "Super administrator" if is_super_admin else "Administrator" if is_admin else "Employee"
 if not is_admin:
-    role_label = f"Employee · {current_user.get('employee_tag') or 'SO'}"
+    role_label = f"Employee · {current_user.get('employee_tag') or 'Unassigned'}"
 
 with st.container(border=True):
     account_identity, account_actions = st.columns([3, 2])
@@ -442,6 +568,16 @@ if is_admin:
                 "Interested customers", interested_customer_count
             )
         st.caption("Count is based on submitted customer entries.")
+
+        mtd_today = datetime.now(APP_TIMEZONE).date()
+        mtd_performance = get_mtd_performance(
+            current_user["id"],
+            mtd_today.replace(day=1).isoformat(),
+            mtd_today.isoformat(),
+        )
+        _render_admin_mtd_performance(
+            current_user["id"], mtd_performance
+        )
 
         st.subheader("Employee submission summary")
         st.caption("All-time totals and entries submitted yesterday (India Standard Time).")
@@ -831,7 +967,7 @@ else:
         unsafe_allow_html=True,
     )
 
-    role_tag = current_user.get("employee_tag") or "SO"
+    role_tag = current_user.get("employee_tag") or "Unassigned"
     st.caption(f"Employee role: {role_tag}")
     entry_tab, records_tab, commitment_tab = st.tabs(
         ["New entry", "My records", "Commitments for the day"]
@@ -948,12 +1084,26 @@ else:
             st.dataframe(
                 records_df, width="stretch", hide_index=True
             )
+            st.subheader("Update your own proposal stage or loan amount")
+            proposal_search = st.text_input(
+                "Search by customer name or phone number",
+                key="own_proposal_search",
+            )
+            matching_own_records = filter_proposals_by_text(
+                get_owned_records(current_user["id"]), proposal_search
+            )
             record_by_id = {
                 int(record["Proposal ID"]): record
-                for record in get_owned_records(current_user["id"])
+                for record in matching_own_records
             }
             if record_by_id:
-                st.subheader("Update your own proposal stage or loan amount")
+                st.dataframe(
+                    pd.DataFrame(matching_own_records)[
+                        ["Proposal ID", "Customer Name", "Contact Number", "Stage"]
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
                 with st.form("update_proposal_form"):
                     selected_record_id = st.selectbox(
                         "Proposal",
@@ -964,8 +1114,17 @@ else:
                         ),
                     )
                     selected_record = record_by_id[selected_record_id]
-                    stage_index = PROPOSAL_STAGES.index(selected_record["Stage"])
-                    allowed_stages = PROPOSAL_STAGES[stage_index : stage_index + 2]
+                    allowed_stages = [
+                        selected_record["Stage"],
+                        *(
+                            stage
+                            for stage in PROPOSAL_STAGES
+                            if stage
+                            in EMPLOYEE_STAGE_TRANSITIONS.get(
+                                selected_record["Stage"], set()
+                            )
+                        ),
+                    ]
                     proposed_stage = st.selectbox(
                         "Stage",
                         options=allowed_stages,
@@ -995,7 +1154,7 @@ else:
                         st.success("Proposal updated.")
                         st.rerun()
             else:
-                st.info("You do not have any proposals of your own to update.")
+                st.info("No proposals match your search.")
         else:
             st.info("Your saved entries will appear here.")
 
@@ -1004,12 +1163,38 @@ else:
             "Choose whether you are committing to log a proposal and/or disburse "
             "a proposal today. Login commitments move the selected proposal to Login."
         )
-        available_login = get_owned_records(
-            current_user["id"], stages=("Yet to login",)
+        login_proposal_search = st.text_input(
+            "Search Yet to login proposals by customer name or phone number",
+            key="login_proposal_search",
         )
-        available_disbursement = get_available_records(
-            current_user["id"], stages=("SUD",)
+        available_login = filter_proposals_by_text(
+            get_owned_records(current_user["id"], stages=("Yet to login",)),
+            login_proposal_search,
         )
+        if available_login:
+            st.dataframe(
+                pd.DataFrame(available_login)[
+                    ["Proposal ID", "Customer Name", "Contact Number", "Employee Name"]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+        disbursement_proposal_search = st.text_input(
+            "Search SUD proposals by customer name or phone number",
+            key="disbursement_proposal_search",
+        )
+        available_disbursement = filter_proposals_by_text(
+            get_available_records(current_user["id"], stages=("SUD",)),
+            disbursement_proposal_search,
+        )
+        if available_disbursement:
+            st.dataframe(
+                pd.DataFrame(available_disbursement)[
+                    ["Proposal ID", "Customer Name", "Contact Number", "Employee Name"]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
         login_by_id = {
             int(record["Proposal ID"]): record for record in available_login
         }
@@ -1035,6 +1220,7 @@ else:
                         format_func=lambda record_id: (
                             f"#{record_id} · "
                             f"{login_by_id[record_id]['Customer Name']} · "
+                            f"{login_by_id[record_id]['Contact Number']} · "
                             f"{login_by_id[record_id]['Employee Name']}"
                         ),
                         key="login_commitment_record",
@@ -1092,6 +1278,7 @@ else:
                         format_func=lambda record_id: (
                             f"#{record_id} · "
                             f"{disbursement_by_id[record_id]['Customer Name']} · "
+                            f"{disbursement_by_id[record_id]['Contact Number']} · "
                             f"{disbursement_by_id[record_id]['Employee Name']}"
                         ),
                         key="disbursement_commitment_records",

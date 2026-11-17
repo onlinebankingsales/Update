@@ -51,8 +51,16 @@ such as a persistent volume when deploying.
   super administrator can update employee numbers and administrator report
   numbers from Accounts.
 - Each proposal has a loan amount and a stage: Yet to login, Login, Pending for
-  Sanction, SUD, or Disbursement. Employees can update the loan amount and move
-  a proposal only to the next stage.
+  Sanction, SUD, Rejected, or Disbursed. Employees follow Yet to login -> Login
+  -> Pending for Sanction -> Rejected or SUD -> Disbursed. Rejected proposals
+  are terminal and do not appear in later-stage selections. Administrators can
+  correct any proposal status and loan amount within their cluster.
+- Proposal selectors can be searched by customer name or phone number; matches
+  appear below the search field as you type. The admin Overview shows separate
+  RM and SO MTD performance tables. Login and Disbursed counts include
+  proposals that reached those statuses this month, even if they later
+  advanced; values use the latest loan amount. Clicking a metric opens the
+  underlying proposals for correction.
 - The Commitments for the day tab records Login and Disbursement Yes/No
   commitments. Login commitments select a Yet to login proposal and update it
   to Login; disbursement commitments can include one or more SUD proposals.
@@ -194,7 +202,8 @@ The employee template starts the login commitment flow. Employees can answer
 with `LOGIN YES` or `LOGIN NO`, select a proposal by ID, enter the loan amount,
 then answer `DISBURSEMENT YES` or `DISBURSEMENT NO` and select one or more SUD
 proposal IDs. During an open WhatsApp conversation they can also send
-`STAGE <proposal ID> <stage>` or `AMOUNT <proposal ID> <amount>`. Meta requires
+`SEARCH <customer name or phone>` while selecting a login proposal,
+`STAGE <proposal ID> <stage>`, or `AMOUNT <proposal ID> <amount>`. Meta requires
 approved templates for scheduled messages outside the customer-service
 conversation window. Report snapshots are stored in the shared database so
 the 10:00 AM and 8:30 PM reports are sent only when their report content has

@@ -25,8 +25,17 @@ PROPOSAL_STAGES = (
     "Login",
     "Pending for Sanction",
     "SUD",
-    "Disbursement",
+    "Rejected",
+    "Disbursed",
 )
+EMPLOYEE_STAGE_TRANSITIONS = {
+    "Yet to login": {"Login"},
+    "Login": {"Pending for Sanction"},
+    "Pending for Sanction": {"Rejected", "SUD"},
+    "SUD": {"Disbursed"},
+    "Rejected": set(),
+    "Disbursed": set(),
+}
 COMMITMENT_TYPES = ("Login", "Disbursement")
 APP_TIMEZONE = timezone(timedelta(hours=5, minutes=30), name="UTC+05:30")
 
@@ -254,6 +263,13 @@ def _initialize_sqlite_schema(connection):
             loan_amount REAL NOT NULL DEFAULT 0 CHECK (loan_amount >= 0),
             stage_updated_at TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS proposal_stage_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+            stage TEXT NOT NULL,
+            changed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            changed_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS commitments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             employee_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -287,6 +303,8 @@ def _initialize_sqlite_schema(connection):
         );
         CREATE INDEX IF NOT EXISTS records_user_date_idx
             ON records(user_id, entry_date, id);
+        CREATE INDEX IF NOT EXISTS proposal_stage_history_mtd_idx
+            ON proposal_stage_history(changed_at, stage, record_id);
         """
     )
     user_columns = {
@@ -333,6 +351,9 @@ def _initialize_sqlite_schema(connection):
     ):
         if column not in record_columns:
             connection.execute(f"ALTER TABLE records ADD COLUMN {column} {definition}")
+    connection.execute(
+        "UPDATE records SET stage = 'Disbursed' WHERE stage = 'Disbursement'"
+    )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS users_assigned_rm_idx ON users(assigned_rm_id)"
     )
@@ -396,6 +417,17 @@ def _initialize_postgres_schema(connection):
         """
     )
     connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS proposal_stage_history (
+            id BIGSERIAL PRIMARY KEY,
+            record_id BIGINT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+            stage TEXT NOT NULL,
+            changed_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+            changed_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
         """ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by_user_id
            BIGINT REFERENCES users(id) ON DELETE SET NULL"""
     )
@@ -432,6 +464,9 @@ def _initialize_postgres_schema(connection):
     )
     connection.execute(
         "ALTER TABLE records ADD COLUMN IF NOT EXISTS stage_updated_at TEXT NOT NULL DEFAULT ''"
+    )
+    connection.execute(
+        "UPDATE records SET stage = 'Disbursed' WHERE stage = 'Disbursement'"
     )
     connection.execute(
         """
@@ -489,6 +524,10 @@ def _initialize_postgres_schema(connection):
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS users_assigned_rm_idx ON users(assigned_rm_id)"
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS proposal_stage_history_mtd_idx
+           ON proposal_stage_history(changed_at, stage, record_id)"""
     )
     connection.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS users_active_phone_idx
@@ -916,6 +955,21 @@ def get_owned_records(employee_id, stages=None):
     return [dict(record) for record in records]
 
 
+def filter_proposals_by_text(records, search_text):
+    search_text = (search_text or "").strip().casefold()
+    if not search_text:
+        return list(records)
+    searchable_fields = ("Customer Name", "Contact Number")
+    return [
+        record
+        for record in records
+        if any(
+            search_text in str(record.get(field) or "").casefold()
+            for field in searchable_fields
+        )
+    ]
+
+
 def update_proposal(requester_id, record_id, stage=None, loan_amount=None):
     if stage is not None and stage not in PROPOSAL_STAGES:
         raise ValueError("Choose a valid proposal stage.")
@@ -925,32 +979,59 @@ def update_proposal(requester_id, record_id, stage=None, loan_amount=None):
         raise ValueError("Loan amount must be a finite non-negative number.")
     with _connection(write=True) as connection:
         requester = connection.execute(
-            """SELECT id, role FROM users
+            """SELECT id, username, role FROM users
                WHERE id = ? AND is_active = 1""",
             (requester_id,),
         ).fetchone()
         record = connection.execute(
-            "SELECT id, user_id, stage FROM records WHERE id = ?",
+            "SELECT id, user_id, admin_owner_id, stage FROM records WHERE id = ?",
             (record_id,),
         ).fetchone()
-        if not requester or requester["role"] != "user":
-            raise ValueError("Only employees can update proposals.")
+        if not requester:
+            raise ValueError("The account is no longer available.")
         if not record:
             raise ValueError("That proposal no longer exists.")
-        if record["user_id"] != requester_id:
-            raise ValueError("You can only update your own proposals.")
+        requester_role = _effective_role(requester)
+        is_admin = requester_role in ("admin", "super_admin")
+        if is_admin:
+            if (
+                requester_role != "super_admin"
+                and record["admin_owner_id"] != requester_id
+            ):
+                raise ValueError("You can only update proposals in your own cluster.")
+        elif requester["role"] == "user":
+            if record["user_id"] != requester_id:
+                raise ValueError("You can only update your own proposals.")
+        else:
+            raise ValueError("Only employees and administrators can update proposals.")
 
-        if stage is not None:
-            current_index = PROPOSAL_STAGES.index(record["stage"])
-            target_index = PROPOSAL_STAGES.index(stage)
-            if target_index != current_index and target_index != current_index + 1:
-                raise ValueError("Move proposals only to the next stage in the workflow.")
+        if stage is not None and stage != record["stage"] and not is_admin:
+            if stage not in EMPLOYEE_STAGE_TRANSITIONS.get(record["stage"], set()):
+                raise ValueError("Choose a valid next proposal stage.")
         assignments = []
         parameters = []
         if stage is not None and stage != record["stage"]:
+            changed_at = datetime.now(APP_TIMEZONE).isoformat(timespec="seconds")
+            if is_admin:
+                if stage == "Yet to login":
+                    connection.execute(
+                        """DELETE FROM proposal_stage_history
+                           WHERE record_id = ? AND stage IN ('Login', 'Disbursed')""",
+                        (record_id,),
+                    )
+                elif stage != "Disbursed":
+                    connection.execute(
+                        """DELETE FROM proposal_stage_history
+                           WHERE record_id = ? AND stage = 'Disbursed'""",
+                        (record_id,),
+                    )
             assignments.extend(("stage = ?", "stage_updated_at = ?"))
-            parameters.extend(
-                (stage, datetime.now(APP_TIMEZONE).isoformat(timespec="seconds"))
+            parameters.extend((stage, changed_at))
+            connection.execute(
+                """INSERT INTO proposal_stage_history
+                   (record_id, stage, changed_by_user_id, changed_at)
+                   VALUES (?, ?, ?, ?)""",
+                (record_id, stage, requester_id, changed_at),
             )
         if loan_amount is not None:
             assignments.append("loan_amount = ?")
@@ -961,6 +1042,137 @@ def update_proposal(requester_id, record_id, stage=None, loan_amount=None):
                 f"UPDATE records SET {', '.join(assignments)} WHERE id = ?",
                 parameters,
             )
+
+
+def get_mtd_performance(admin_id, start_date, end_date):
+    with _connection() as connection:
+        admin = connection.execute(
+            """SELECT id, username, role FROM users
+               WHERE id = ? AND is_active = 1""",
+            (admin_id,),
+        ).fetchone()
+        if not admin or _effective_role(admin) not in ("admin", "super_admin"):
+            raise ValueError("Only administrators can view MTD performance.")
+
+        record_scope = ""
+        employee_scope = ""
+        parameters = []
+        if _effective_role(admin) != "super_admin":
+            record_scope = " AND proposal.admin_owner_id = ?"
+            employee_scope = " AND employee.created_by_user_id = ?"
+            parameters.append(admin_id)
+        parameters.extend((start_date, end_date))
+        if employee_scope:
+            parameters.append(admin_id)
+        rows = connection.execute(
+            f"""
+            SELECT employee.id AS employee_id,
+                   employee.employee_name AS employee_name,
+                   employee.employee_tag AS employee_role,
+                   proposal.id AS record_id,
+                   proposal.entry_date AS entry_date,
+                   proposal.logged_time AS logged_time,
+                   proposal.customer_name AS customer_name,
+                   proposal.contact_number AS contact_number,
+                   proposal.acres AS acres,
+                   proposal.village AS village,
+                   proposal.mandal AS mandal,
+                   proposal.district AS district,
+                   proposal.remarks AS remarks,
+                   proposal.stage AS current_stage,
+                   proposal.loan_amount AS loan_amount,
+                   proposal.stage_updated_at AS stage_updated_at,
+                   history.stage AS achieved_stage,
+                   history.changed_at AS achieved_at
+            FROM users AS employee
+            LEFT JOIN records AS proposal
+              ON proposal.user_id = employee.id {record_scope}
+            LEFT JOIN proposal_stage_history AS history
+              ON history.record_id = proposal.id
+             AND SUBSTR(history.changed_at, 1, 10) BETWEEN ? AND ?
+             AND history.stage IN ('Login', 'Disbursed')
+            WHERE employee.role = 'user' AND employee.is_active = 1
+              {employee_scope}
+            ORDER BY employee.employee_name, proposal.id, history.changed_at
+            """,
+            parameters,
+        ).fetchall()
+
+    employees = {}
+    details = {}
+    for row in rows:
+        employee_id = row["employee_id"]
+        if row["employee_role"] not in EMPLOYEE_TAGS:
+            continue
+        employees.setdefault(
+            employee_id,
+            {
+                "Employee ID": employee_id,
+                "Employee Name": row["employee_name"],
+                "Employee Role": row["employee_role"],
+                "Logins (count)": 0,
+                "Login Value": 0.0,
+                "Disb no": 0,
+                "Disb Volume": 0.0,
+            },
+        )
+        employee_details = details.setdefault(
+            employee_id, {"Login": {}, "Disbursed": {}}
+        )
+        if row["record_id"] is None or row["achieved_stage"] not in (
+            "Login",
+            "Disbursed",
+        ):
+            continue
+        stage_details = employee_details[row["achieved_stage"]]
+        stage_details.setdefault(
+            row["record_id"],
+            {
+                "Proposal ID": row["record_id"],
+                "Employee Name": row["employee_name"],
+                "Employee Role": row["employee_role"],
+                "Entry Date": row["entry_date"],
+                "Logged Time": row["logged_time"],
+                "Customer Name": row["customer_name"],
+                "Contact Number": row["contact_number"],
+                "Acres": row["acres"],
+                "Village": row["village"],
+                "Mandal": row["mandal"],
+                "District": row["district"],
+                "Remarks": row["remarks"],
+                "Stage": row["current_stage"],
+                "Loan Amount": row["loan_amount"],
+                "Stage Updated At": row["stage_updated_at"],
+                "Reached Date": row["achieved_at"][:10],
+            },
+        )
+
+    for employee_id, employee in employees.items():
+        login_records = details[employee_id]["Login"].values()
+        disbursed_records = details[employee_id]["Disbursed"].values()
+        employee["Logins (count)"] = len(details[employee_id]["Login"])
+        employee["Login Value"] = sum(
+            float(record["Loan Amount"] or 0) for record in login_records
+        )
+        employee["Disb no"] = len(details[employee_id]["Disbursed"])
+        employee["Disb Volume"] = sum(
+            float(record["Loan Amount"] or 0) for record in disbursed_records
+        )
+
+    return {
+        "employees": sorted(
+            employees.values(), key=lambda item: item["Employee Name"].casefold()
+        ),
+        "details": {
+            employee_id: {
+                stage: sorted(
+                    records.values(), key=lambda item: item["Proposal ID"]
+                )
+                for stage, records in stage_details.items()
+            }
+            for employee_id, stage_details in details.items()
+        },
+    }
 
 
 def save_commitment_response(employee_id, commitment_type, answer, record_ids=()):
@@ -1392,6 +1604,13 @@ def migrate_sqlite_to_postgres(source_path=None):
             if "commitments" in source_tables
             else ()
         )
+        proposal_stage_history = (
+            source.execute(
+                "SELECT * FROM proposal_stage_history ORDER BY id"
+            ).fetchall()
+            if "proposal_stage_history" in source_tables
+            else ()
+        )
         commitment_responses = (
             source.execute("SELECT * FROM commitment_responses").fetchall()
             if "commitment_responses" in source_tables
@@ -1458,11 +1677,7 @@ def migrate_sqlite_to_postgres(source_path=None):
                     created_by_user_id,
                     user["is_active"] if "is_active" in user_columns else 1,
                     user["phone_number"] if "phone_number" in user_columns else None,
-                    (
-                        user["employee_tag"]
-                        if "employee_tag" in user_columns
-                        else "SO" if user["username"].startswith("6") else "RM"
-                    )
+                    user["employee_tag"] if "employee_tag" in user_columns else None
                     if user["role"] == "user"
                     else None,
                     user["assigned_rm_id"]
@@ -1484,6 +1699,15 @@ def migrate_sqlite_to_postgres(source_path=None):
             )
             if remark not in REMARK_OPTIONS:
                 remark = "Not interested"
+            stage = (
+                record["stage"]
+                if "stage" in record_columns
+                else "Yet to login"
+            )
+            if stage == "Disbursement":
+                stage = "Disbursed"
+            if stage not in PROPOSAL_STAGES:
+                stage = "Yet to login"
             connection.execute(
                 """
                 INSERT INTO records (
@@ -1506,16 +1730,32 @@ def migrate_sqlite_to_postgres(source_path=None):
                     record["mandal"],
                     record["district"],
                     remark,
-                    record["stage"]
-                    if "stage" in record_columns
-                    and record["stage"] in PROPOSAL_STAGES
-                    else "Yet to login",
+                    stage,
                     record["loan_amount"]
                     if "loan_amount" in record_columns
                     else 0,
                     record["stage_updated_at"]
                     if "stage_updated_at" in record_columns
                     else "",
+                ),
+            )
+
+        for history in proposal_stage_history:
+            history_stage = (
+                "Disbursed"
+                if history["stage"] == "Disbursement"
+                else history["stage"]
+            )
+            connection.execute(
+                """INSERT INTO proposal_stage_history
+                   (id, record_id, stage, changed_by_user_id, changed_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    history["id"],
+                    history["record_id"],
+                    history_stage,
+                    history["changed_by_user_id"],
+                    history["changed_at"],
                 ),
             )
 
@@ -1562,5 +1802,13 @@ def migrate_sqlite_to_postgres(source_path=None):
             """SELECT setval(pg_get_serial_sequence('records', 'id'),
                COALESCE(MAX(id), 1), COUNT(*) > 0) FROM records"""
         )
+        connection.execute(
+            """SELECT setval(pg_get_serial_sequence('proposal_stage_history', 'id'),
+               COALESCE(MAX(id), 1), COUNT(*) > 0) FROM proposal_stage_history"""
+        )
 
-    return {"users": len(users), "records": len(records)}
+    return {
+        "users": len(users),
+        "records": len(records),
+        "proposal_stage_history": len(proposal_stage_history),
+    }

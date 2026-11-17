@@ -151,7 +151,7 @@ class EmployeeWorkflowTests(unittest.TestCase):
 
     def test_proposal_stage_advances_one_step_and_commitment_is_saved(self):
         proposal_id = self._add_record(self.so_id, "Commitment customer")
-        with self.assertRaisesRegex(ValueError, "next stage"):
+        with self.assertRaisesRegex(ValueError, "next proposal stage"):
             data_store.update_proposal(
                 self.so_id, proposal_id, stage="Pending for Sanction"
             )
@@ -168,6 +168,140 @@ class EmployeeWorkflowTests(unittest.TestCase):
         self.assertEqual(len(commitment), 1)
         self.assertEqual(commitment[0]["Answer"], "Yes")
         self.assertEqual(commitment[0]["Customer"], "Commitment customer")
+
+    def test_employee_stage_flow_requires_sanction_decision_and_rejected_is_terminal(self):
+        proposal_id = self._add_record(self.so_id, "Rejected customer")
+        data_store.update_proposal(self.so_id, proposal_id, stage="Login")
+
+        with self.assertRaisesRegex(ValueError, "next proposal stage"):
+            data_store.update_proposal(self.so_id, proposal_id, stage="SUD")
+
+        data_store.update_proposal(
+            self.so_id, proposal_id, stage="Pending for Sanction"
+        )
+        data_store.update_proposal(self.so_id, proposal_id, stage="Rejected")
+
+        with self.assertRaisesRegex(ValueError, "next proposal stage"):
+            data_store.update_proposal(self.so_id, proposal_id, stage="SUD")
+
+        proposal = data_store.get_owned_records(self.so_id)[0]
+        self.assertEqual(proposal["Stage"], "Rejected")
+
+    def test_whatsapp_reports_invalid_stage_transition(self):
+        proposal_id = self._add_record(self.so_id, "WhatsApp proposal")
+        data_store.update_proposal(self.so_id, proposal_id, stage="Login")
+
+        with patch.object(whatsapp_bot, "send_text") as send_text:
+            whatsapp_bot._handle_employee_message(
+                self.so_id,
+                "+919000000003",
+                f"STAGE {proposal_id} SUD",
+            )
+
+        send_text.assert_called_once_with(
+            "+919000000003", "Choose a valid next proposal stage."
+        )
+        self.assertEqual(
+            data_store.get_owned_records(self.so_id)[0]["Stage"], "Login"
+        )
+
+    def test_mtd_performance_retains_reached_stages_and_admin_can_correct_proposals(self):
+        so_proposal_id = self._add_record(self.so_id, "SO login")
+        rm_proposal_id = self._add_record(self.rm_id, "RM disbursement")
+        data_store.update_proposal(
+            self.so_id, so_proposal_id, stage="Login", loan_amount=400000
+        )
+        data_store.update_proposal(
+            self.so_id, so_proposal_id, stage="Pending for Sanction"
+        )
+        data_store.update_proposal(self.so_id, so_proposal_id, stage="SUD")
+        data_store.update_proposal(
+            self.rm_id, rm_proposal_id, stage="Login", loan_amount=600000
+        )
+        data_store.update_proposal(
+            self.rm_id, rm_proposal_id, stage="Pending for Sanction"
+        )
+        data_store.update_proposal(self.rm_id, rm_proposal_id, stage="SUD")
+        data_store.update_proposal(self.rm_id, rm_proposal_id, stage="Disbursed")
+
+        performance = data_store.get_mtd_performance(
+            self.admin_id, "2026-11-01", "2026-11-30"
+        )
+        employees = {
+            employee["Employee ID"]: employee
+            for employee in performance["employees"]
+        }
+        self.assertEqual(employees[self.so_id]["Logins (count)"], 1)
+        self.assertEqual(employees[self.so_id]["Login Value"], 400000)
+        self.assertEqual(employees[self.so_id]["Disb no"], 0)
+        self.assertEqual(employees[self.rm_id]["Logins (count)"], 1)
+        self.assertEqual(employees[self.rm_id]["Disb no"], 1)
+        self.assertEqual(employees[self.rm_id]["Disb Volume"], 600000)
+        self.assertEqual(
+            performance["details"][self.so_id]["Login"][0]["Stage"], "SUD"
+        )
+
+        data_store.update_proposal(
+            self.admin_id, rm_proposal_id, stage="Disbursed", loan_amount=650000
+        )
+        corrected = data_store.get_mtd_performance(
+            self.admin_id, "2026-11-01", "2026-11-30"
+        )
+        corrected_rm = next(
+            employee for employee in corrected["employees"]
+            if employee["Employee ID"] == self.rm_id
+        )
+        self.assertEqual(corrected_rm["Disb no"], 1)
+        self.assertEqual(corrected_rm["Disb Volume"], 650000)
+        data_store.update_proposal(self.admin_id, rm_proposal_id, stage="SUD")
+        status_corrected = data_store.get_mtd_performance(
+            self.admin_id, "2026-11-01", "2026-11-30"
+        )
+        corrected_rm = next(
+            employee for employee in status_corrected["employees"]
+            if employee["Employee ID"] == self.rm_id
+        )
+        self.assertEqual(corrected_rm["Disb no"], 0)
+        self.assertEqual(corrected_rm["Disb Volume"], 0)
+
+    def test_admin_proposal_corrections_are_limited_to_their_cluster(self):
+        other_admin_id = data_store.create_account(
+            self.super_admin_id,
+            "admin02",
+            "Other Cluster",
+            "safe-password-6",
+            role="admin",
+        )
+        other_employee_id = data_store.create_account(
+            other_admin_id,
+            "SO700",
+            "Other SO",
+            "safe-password-7",
+            phone_number="+919000000007",
+            employee_tag="SO",
+        )
+        proposal_id = self._add_record(other_employee_id, "Other cluster proposal")
+
+        with self.assertRaisesRegex(ValueError, "own cluster"):
+            data_store.update_proposal(self.admin_id, proposal_id, stage="Login")
+
+        data_store.update_proposal(
+            self.super_admin_id, proposal_id, stage="Disbursed"
+        )
+        proposal = data_store.get_user_records(other_employee_id)[0]
+        self.assertEqual(proposal["Stage"], "Disbursed")
+
+    def test_proposal_search_matches_customer_name_or_phone_only(self):
+        proposal_id = self._add_record(self.so_id, "Searchable customer")
+        proposals = data_store.get_owned_records(self.so_id)
+        by_customer = data_store.filter_proposals_by_text(
+            proposals, "searchable customer"
+        )
+        by_phone = data_store.filter_proposals_by_text(proposals, "9876543210")
+        by_location = data_store.filter_proposals_by_text(proposals, "village")
+        self.assertEqual(by_customer[0]["Proposal ID"], proposal_id)
+        self.assertEqual(by_phone[0]["Proposal ID"], proposal_id)
+        self.assertEqual(by_location, [])
 
     def test_existing_database_is_migrated_with_stage_and_phone_fields(self):
         legacy_path = Path(self.temp_dir.name) / "legacy.db"

@@ -29,9 +29,13 @@ class EmployeeWorkflowTests(unittest.TestCase):
         self.backup_patch = patch.object(data_store, "_backup_sqlite_database")
         self.backup_patch.start()
         self.assertTrue(data_store.initialize_database())
-        self.super_admin_id = data_store.authenticate(
+        super_admin = data_store.authenticate(
             data_store.SUPER_ADMIN_USERNAME, "safe-test-password"
-        )["id"]
+        )
+        self.assertEqual(data_store.SUPER_ADMIN_USERNAME, "JeevanReddy")
+        self.assertEqual(super_admin["username"], "JeevanReddy")
+        self.assertEqual(super_admin["role"], "super_admin")
+        self.super_admin_id = super_admin["id"]
         self.admin_id = data_store.create_account(
             self.super_admin_id, "admin01", "Cluster Admin", "safe-password-1", "admin"
         )

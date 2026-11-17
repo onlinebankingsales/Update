@@ -14,7 +14,7 @@ DATABASE_PATH = Path(
     os.environ.get("DATA_DB_PATH", str(DEFAULT_DATABASE_PATH))
 ).expanduser()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-SUPER_ADMIN_USERNAME = "352247"
+SUPER_ADMIN_USERNAME = "JeevanReddy"
 PASSWORD_ITERATIONS = 600_000
 USERNAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]{3,32}\Z")
 DUMMY_SALT = b"streamlit-field-app-login-salt"

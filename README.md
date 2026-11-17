@@ -15,11 +15,11 @@ uv sync
 
 For local development with SQLite, explicitly allow the local database and set
 credentials for the super administrator before starting the app. The
-super-admin username is fixed to `352247`; the password must contain at least 8
+super-admin username is fixed to `JeevanReddy`; the password must contain at least 8
 characters.
 
 ```sh
-export INITIAL_ADMIN_USERNAME="352247"
+export INITIAL_ADMIN_USERNAME="JeevanReddy"
 export INITIAL_ADMIN_PASSWORD="use-a-strong-password"
 export REQUIRE_DATABASE_URL="false"
 uv run streamlit run streamlit_app.py
@@ -27,7 +27,7 @@ uv run streamlit run streamlit_app.py
 
 The first launch stores a salted password hash in a persistent local database
 at `~/.field_operations/records.db` by default. For an existing database, the
-account named `352247` is treated as the super administrator and the existing
+account named `JeevanReddy` is treated as the super administrator and the existing
 accounts and records are migrated in place. The environment variables are only
 used to create the first super-admin account; changing them later does not
 change the saved password. Set `DATA_DB_PATH` to use a different location,
@@ -35,7 +35,7 @@ such as a persistent volume when deploying.
 
 ## Accounts and data
 
-- Super administrator `352247` can create administrators and employees, manage
+- Super administrator `JeevanReddy` can create administrators and employees, manage
    every account, and view or download all records.
 - Administrators can create and delete only the employees they created, and can
    view or download only those employees' records. They can also reset the
@@ -139,7 +139,7 @@ overwriting either; set `DATA_DB_PATH` to the database you intend to use.
    ```toml
    DATABASE_URL = "postgresql://..."
    REQUIRE_DATABASE_URL = true
-   INITIAL_ADMIN_USERNAME = "352247"
+   INITIAL_ADMIN_USERNAME = "JeevanReddy"
    INITIAL_ADMIN_PASSWORD = "set-the-existing-or-a-new-strong-password"
    ```
 

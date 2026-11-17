@@ -311,12 +311,6 @@ def _initialize_sqlite_schema(connection):
     ):
         if column not in user_columns:
             connection.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
-    connection.execute(
-        """UPDATE users SET employee_tag =
-           CASE WHEN username LIKE '6%' THEN 'SO' ELSE 'RM' END
-           WHERE role = 'user' AND employee_tag IS NULL"""
-    )
-
     record_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(records)")
     }
@@ -419,11 +413,6 @@ def _initialize_postgres_schema(connection):
     connection.execute(
         """ALTER TABLE users ADD COLUMN IF NOT EXISTS assigned_rm_id BIGINT
            REFERENCES users(id) ON DELETE SET NULL"""
-    )
-    connection.execute(
-        """UPDATE users SET employee_tag =
-           CASE WHEN username LIKE '6%' THEN 'SO' ELSE 'RM' END
-           WHERE role = 'user' AND employee_tag IS NULL"""
     )
     connection.execute(
         """ALTER TABLE records ADD COLUMN IF NOT EXISTS admin_owner_id

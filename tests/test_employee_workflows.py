@@ -169,7 +169,7 @@ class EmployeeWorkflowTests(unittest.TestCase):
         self.assertEqual(commitment[0]["Answer"], "Yes")
         self.assertEqual(commitment[0]["Customer"], "Commitment customer")
 
-    def test_existing_database_is_migrated_with_tags_stage_and_phone_fields(self):
+    def test_existing_database_is_migrated_with_stage_and_phone_fields(self):
         legacy_path = Path(self.temp_dir.name) / "legacy.db"
         with closing(sqlite3.connect(legacy_path)) as connection:
             connection.executescript(
@@ -237,7 +237,7 @@ class EmployeeWorkflowTests(unittest.TestCase):
                 record = connection.execute(
                     "SELECT stage, loan_amount FROM records WHERE id = 1"
                 ).fetchone()
-        self.assertEqual(employee["employee_tag"], "SO")
+        self.assertIsNone(employee["employee_tag"])
         self.assertIsNone(employee["phone_number"])
         self.assertEqual(record["stage"], "Yet to login")
         self.assertEqual(record["loan_amount"], 0)
